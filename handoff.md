@@ -1,55 +1,53 @@
 # HANDOFF.md — Open Wages → Claude Code Session
 
 ## TL;DR
-You're picking up a clean-room Rust reimplementation of *Wages of War: The Business of Battle* (1996). The scaffold is built, skills are written, Cargo workspace compiles. **Your first job is Phase 1: get the original game files and run the survey tool to classify every file.**
+You're picking up a clean-room Rust reimplementation of *Wages of War: The Business of Battle* (1996). Phases 1 and 2 are complete — all text game file formats are documented and parsed. **Current work: Phase 3 (ow-core game rules), sprite container RE, and OXCE architecture study.**
 
 ## What's Done
-- [x] Full Cargo workspace scaffold (5 crates: ow-data, ow-core, ow-render, ow-audio, ow-app)
-- [x] CLAUDE.md with full project rules, tech stack, conventions
-- [x] README.md
-- [x] Three `.skill` files with deep reference material:
-  - `skills/win95-binary-re.skill` — PE32 reverse engineering workflow (Ghidra, x32dbg, import tracing)
-  - `skills/game-dat-parser.skill` — .dat file triage, text/binary parsers, survey tool reference, format doc templates
-  - `skills/isometric-engine.skill` — Full isometric engine architecture, combat system, pathfinding, renderer
-- [x] Rust survey tool at `crates/ow-tools` (`cargo run -p ow-tools --bin survey`) — classify all files in game directory
-- [x] Rust triage tool at `crates/ow-tools` (`cargo run -p ow-tools --bin triage`) — deep-inspect individual files
-- [x] Stub lib.rs in all crates
-- [x] Workspace Cargo.toml with shared dependencies
 
-## What's NOT Done — Immediate Next Steps
+### Phase 1: Data Reconnaissance — COMPLETE
+- [x] Game ISO obtained and extracted to `data/WOW/` (gitignored)
+- [x] Survey tool run against all 1254 files — classified as text/binary/mixed
+- [x] 10 format specification documents in `docs/FORMAT_*.md`
+- [x] Binary formats triaged with entropy/struct analysis
+- [x] Key discovery: .OBJ/.SPR/.TIL/ANIM .DAT all share ONE sprite container format (120+ files)
 
-### Phase 1: Data Reconnaissance (DO THIS FIRST)
-1. **Obtain the game files.** The ISO is on Archive.org: https://archive.org/details/wages-of-war-the-business-of-battle
-   - Download the ISO
-   - Extract/mount it
-   - The installer is 16-bit — either use `otvdm`/`winevdm` or just extract files with 7-Zip
-   - The game .exe is 32-bit PE even though the installer is 16-bit
-2. **Run the survey tool:**
-   ```powershell
-   cargo run -p ow-tools --bin survey -- "C:\Games\WagesOfWar"
-   ```
-   This classifies every file as text/binary/mixed and dumps `file_survey.json`.
-3. **For each .dat file identified as text:** Open it, document the schema in `docs/FORMAT_<name>.md`
-4. **For each binary file:** Run `cargo run -p ow-tools --bin triage -- <file>`, note magic bytes, struct patterns, file sizes
-5. **Run `strings` on the main .exe:** `strings wow.exe > docs/exe_strings.txt` — this reveals filenames, error messages, format identifiers
+### Phase 2: Data Parsers — COMPLETE
+- [x] 12 strongly-typed Rust parsers in `ow-data` crate — **87 tests, all passing**
+- [x] Parsers: mercs, weapons, equip, strings, mission, ai_nodes, moves, shop, buttons, animation, target, textrect
+- [x] Full game data validator (case-insensitive, checks 69+ required files)
+- [x] Rust RE tools (survey + triage) in `ow-tools` crate — replaced Python
 
-### Phase 2: Data Parsers (ow-data crate)
-1. Implement text .dat parsers based on documented schemas
-2. Implement sprite/BMP loader (likely 256-color indexed with a .pal or embedded palette)
-3. Implement map/terrain loader (binary format TBD from Phase 1)
-4. Implement data validator (checks all required files present)
-5. Write unit tests against known values from the original files
+### Infrastructure
+- [x] Full Cargo workspace scaffold (6 crates: ow-data, ow-core, ow-render, ow-audio, ow-app, ow-tools)
+- [x] CLAUDE.md, README.md with full FOSS stance (dual MIT/Apache-2.0, no monetization ever)
+- [x] Three `.skill` files with deep RE/parsing/isometric engine reference material
+- [x] GitHub repo live at `suhteevah/open-wages`
+
+## In Progress
 
 ### Phase 3: Core Rules (ow-core crate)
-1. Mercenary stat system (loaded from .dat)
-2. Weapon/equipment system
-3. Initiative-based combat resolution
-4. Suppression + morale
-5. Pathfinding (A* on isometric grid)
-6. Line of sight (Bresenham)
-7. Weather effects
-8. Economy (contracts, payments, reputation)
-9. AI decision trees
+- [ ] Runtime mercenary structs (ActiveMerc, MercStatus)
+- [ ] Initiative-based combat system (TurnOrder, CombatState)
+- [ ] Damage resolution + suppression system
+- [ ] Weather effects on combat
+- [ ] Game state machine (Office → Travel → Mission → Debrief)
+- [ ] Pathfinding (A* on isometric grid)
+- [ ] Line of sight (Bresenham)
+- [ ] Economy (contracts, payments, reputation)
+- [ ] AI decision trees
+
+### Binary Format RE
+- [ ] Sprite container format (.OBJ/.SPR/.TIL/ANIM .DAT) — P1 priority, unlocks all visual assets
+- [ ] MAP format (fixed 248,384 bytes, tile grid)
+- [ ] PCX palette extraction (master 256-color VGA palette)
+- [ ] VLA/VLS audio ("VALS" magic, embedded WAV + subtitle timing)
+- [ ] WRI format (Windows Write — needed for mission 4-16 briefing text)
+
+### Architecture
+- [ ] OXCE (OpenXCOM Extended) architecture study — ruleset system, mod support, rendering, saves
+
+## What's NOT Done — Future Phases
 
 ### Phase 4: Renderer (ow-render crate)
 1. Isometric tile rendering (diamond projection, 64×32 tiles)
@@ -66,20 +64,26 @@ You're picking up a clean-room Rust reimplementation of *Wages of War: The Busin
 5. Sound
 
 ## Key Technical Facts
-- **The .dat files are plaintext.** Community confirmed: editable with Notepad++. This is huge — the data layer is CSV/INI-style, not packed binary.
-- **Engine:** "Random Games 1996-2000 Strategy Engine" per MobyGames
-- **Combat is initiative-based**, NOT I-go-you-go. All units sorted by (Experience + Will) each round.
+- **The .dat files are plaintext.** Editable with Notepad++. The data layer is label-based text, not packed binary.
+- **57 mercenaries** with full stat blocks, bios, and 3-tier fee structures.
+- **57 weapons** across 14 categories with penetration/damage/range/AP cost.
+- **16 missions** with 14-section definition files (contracts, enemy rosters, weather, AI).
+- **AI behavior scripts** with 6 alert escalation levels and 8 action codes.
+- **3 arms dealers** (SERG, ABDULS, FITZ) with per-mission stock cycling.
+- **Hit probability table** (TARGET.DAT) — 100+ row x 20 column lookup, core of combat math.
+- **Combat is initiative-based**, NOT I-go-you-go. All units sorted by (EXP + WIL) each round.
 - **Suppression is a core mechanic** — incoming fire reduces AP even on a miss.
 - **Weather matters** — affects accuracy, sight range, smoke grenades.
-- **The game has a strategic office layer** (hiring, equipment, contracts, intel) AND a tactical mission layer.
+- **Strategic office layer** (hiring, equipment, contracts, intel) + tactical mission layer.
 - **Isometric diamond projection**, standard 2:1 tile ratio.
 
 ## Environment
 - **Machine:** kokonoe (i9-11900K, RTX 3070 Ti, 64GB, Win11)
-- **Toolchain:** Rust stable
+- **Toolchain:** Rust stable (all code is Rust, no Python)
 - **IDE:** VS Code / Claude Code
 - **RE tools available:** Ghidra 11.x, x32dbg, HxD, PE-bear, Process Monitor, Strings (Sysinternals)
 - **SDL2:** Install via vcpkg or pre-built binaries
+- **Reference project:** OpenXCOM Extended (OXCE) — architectural model
 
 ## File Layout
 ```
@@ -90,16 +94,23 @@ open-wages/
 ├── Cargo.toml             # Workspace root
 ├── crates/
 │   ├── ow-core/           # Game logic (combat, economy, AI)
-│   ├── ow-data/           # Original file parsers
+│   ├── ow-data/           # Original file parsers (12 modules, 87 tests)
 │   ├── ow-render/         # Isometric renderer
 │   ├── ow-audio/          # Sound/music
-│   └── ow-app/            # Main binary
-├── crates/ow-tools/       # Rust RE helper binaries
-│   └── src/bin/
-│       ├── survey.rs      # Classify all files in game dir
-│       └── triage.rs      # Deep-inspect individual files
-├── docs/                  # Format specs, mechanics docs
-│   └── architecture.md    # Engine architecture decisions
+│   ├── ow-app/            # Main binary
+│   └── ow-tools/          # RE helper binaries (survey, triage)
+├── docs/                  # 10+ format specs, architecture notes
+│   ├── FORMAT_MERCS.md
+│   ├── FORMAT_WEAPONS.md
+│   ├── FORMAT_EQUIP.md
+│   ├── FORMAT_MSSN.md
+│   ├── FORMAT_AI_NODES.md
+│   ├── FORMAT_TEXT.md
+│   ├── FORMAT_COR.md
+│   ├── FORMAT_BTN.md
+│   ├── FORMAT_CONTRACTS.md
+│   ├── FORMAT_BINARY_SURVEY.md
+│   └── architecture.md
 ├── assets/                # Placeholder/test assets only
 └── skills/                # Reference .skill files
     ├── win95-binary-re.skill
@@ -108,4 +119,4 @@ open-wages/
 ```
 
 ## GitHub
-Repo should be created at `suhteevah/open-wages`. Public from day one — this is an open-source project.
+Repo at `suhteevah/open-wages`. Public from day one — FOSS preservation project, no monetization.

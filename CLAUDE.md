@@ -77,6 +77,7 @@ cargo run -p ow-tools --bin triage -- /path/to/file.dat
 - `cargo fmt` before every commit
 - `cargo clippy -- -W clippy::all` must pass clean
 - All public functions get doc comments
+- **Human-readable inline comments everywhere.** Explain the WHY, not just the what. Annotate format quirks, game mechanic reasoning, and non-obvious parsing logic. Code should be approachable for contributors who don't know Wages of War internals.
 - All structs that touch game data get `#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]`
 - Error types per crate via `thiserror`
 - No `unwrap()` in library crates — only in `ow-app/main.rs` for startup

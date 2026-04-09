@@ -19,6 +19,7 @@
 //! - [`animation`] — Sprite animation sequences (*.COR)
 //! - [`target`] — Hit location probability table (TARGET.DAT)
 //! - [`textrect`] — Text rectangle / UI text layout (TEXTRECT*.DAT)
+//! - [`sprite`] — Binary sprite container format (.OBJ, .SPR, .TIL, ANIM .DAT)
 
 pub mod dat_parser;
 pub mod validator;
@@ -35,3 +36,4 @@ pub mod buttons;
 pub mod animation;
 pub mod target;
 pub mod textrect;
+pub mod sprite;
