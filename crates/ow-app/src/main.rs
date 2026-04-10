@@ -50,6 +50,12 @@ fn main() -> anyhow::Result<()> {
 
     let data_dir = &args.data_dir;
 
+    // The game files live under WOW/ inside the data directory.
+    // Text data files are in WOW/DATA/, buttons in WOW/BUTTONS/, sprites in WOW/SPR/.
+    let wow_data = data_dir.join("WOW").join("DATA");
+    let wow_buttons = data_dir.join("WOW").join("BUTTONS");
+    let wow_spr = data_dir.join("WOW").join("SPR");
+
     // Track which loads succeeded/failed for the final summary banner.
     let mut successes: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
@@ -59,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     //    This is the heart of the game: ~40 mercs with full stat blocks.
     // -----------------------------------------------------------------------
     info!("--- Loading MERCS.DAT ---");
-    match ow_data::mercs::parse_mercs(&data_dir.join("MERCS.DAT")) {
+    match ow_data::mercs::parse_mercs(&wow_data.join("MERCS.DAT")) {
         Ok(mercs) => {
             let count = mercs.len();
             info!(count, "Parsed mercenary roster");
@@ -92,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     //    We also break down weapons by category to verify type parsing.
     // -----------------------------------------------------------------------
     info!("--- Loading WEAPONS.DAT ---");
-    match ow_data::weapons::parse_weapons(&data_dir.join("WEAPONS.DAT")) {
+    match ow_data::weapons::parse_weapons(&wow_data.join("WEAPONS.DAT")) {
         Ok(weapons) => {
             let count = weapons.len();
             info!(count, "Parsed weapon definitions");
@@ -115,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     // 5. EQUIP.DAT — Non-weapon equipment (armor, medkits, tools, etc.).
     // -----------------------------------------------------------------------
     info!("--- Loading EQUIP.DAT ---");
-    match ow_data::equip::parse_equipment(&data_dir.join("EQUIP.DAT")) {
+    match ow_data::equip::parse_equipment(&wow_data.join("EQUIP.DAT")) {
         Ok(items) => {
             let count = items.len();
             info!(count, "Parsed equipment items");
@@ -135,7 +141,7 @@ fn main() -> anyhow::Result<()> {
     //    and status message lives here, referenced by 1-based index.
     // -----------------------------------------------------------------------
     info!("--- Loading ENGWOW.DAT ---");
-    match ow_data::strings::parse_string_table(&data_dir.join("ENGWOW.DAT")) {
+    match ow_data::strings::parse_string_table(&wow_data.join("ENGWOW.DAT")) {
         Ok(table) => {
             let count = table.len();
             info!(count, "Parsed string table");
@@ -159,7 +165,7 @@ fn main() -> anyhow::Result<()> {
     //    mission structure: contract terms, enemy roster, weather, etc.
     // -----------------------------------------------------------------------
     info!("--- Loading MSSN01.DAT ---");
-    match ow_data::mission::parse_mission(&data_dir.join("MSSN01.DAT")) {
+    match ow_data::mission::parse_mission(&wow_data.join("MSSN01.DAT")) {
         Ok(mission) => {
             let contract = &mission.contract;
             info!(
@@ -186,7 +192,7 @@ fn main() -> anyhow::Result<()> {
     // -----------------------------------------------------------------------
     info!("--- Loading AINODE files ---");
     for filename in ["AINODE01.DAT", "AINODE02.DAT", "AINODE03.DAT"] {
-        let path = data_dir.join(filename);
+        let path = wow_data.join(filename);
         if !path.exists() {
             info!("{filename} not found, skipping");
             continue;
@@ -212,7 +218,7 @@ fn main() -> anyhow::Result<()> {
     //    combination of range/skill to base hit chance (0-100%).
     // -----------------------------------------------------------------------
     info!("--- Loading TARGET.DAT ---");
-    match ow_data::target::parse_hit_table(&data_dir.join("TARGET.DAT")) {
+    match ow_data::target::parse_hit_table(&wow_data.join("TARGET.DAT")) {
         Ok(table) => {
             let rows = table.row_count();
             let cols = table.col_count();
@@ -235,7 +241,7 @@ fn main() -> anyhow::Result<()> {
     //     parser can read the header/block structure and extract all rects.
     // -----------------------------------------------------------------------
     info!("--- Loading MAIN.BTN ---");
-    match ow_data::buttons::parse_buttons(&data_dir.join("MAIN.BTN")) {
+    match ow_data::buttons::parse_buttons(&wow_buttons.join("MAIN.BTN")) {
         Ok(layout) => {
             let count = layout.buttons.len();
             info!(count, "Parsed main screen button layout");
@@ -264,7 +270,7 @@ fn main() -> anyhow::Result<()> {
     //     We also decode one frame to verify the RLE decompressor works.
     // -----------------------------------------------------------------------
     info!("--- Loading sprite file (MENUSPR.OBJ) ---");
-    match ow_data::sprite::parse_sprite_file(&data_dir.join("MENUSPR.OBJ")) {
+    match ow_data::sprite::parse_sprite_file(&wow_spr.join("MENUSPR.OBJ")) {
         Ok(sheet) => {
             let sprite_count = sheet.frames.len();
             let total_compressed: usize = sheet.frames.iter().map(|f| f.compressed_data.len()).sum();
