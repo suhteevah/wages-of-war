@@ -1721,17 +1721,81 @@ fn render_mission_map(
 
     // Draw placed mercs as colored squares on the map.
     let iso = mission_iso.as_ref().unwrap_or(&game.iso_config);
-    for (i, merc) in game.game_state.team.iter().enumerate() {
+    for (_i, merc) in game.game_state.team.iter().enumerate() {
         if let Some(pos) = merc.position {
             let iso_tile = TilePos { x: pos.x, y: pos.y };
             let world = iso.tile_to_screen(iso_tile);
             let screen = game.camera.world_to_screen(world);
             let color = Color::RGB(0, 200, 0);
             canvas.set_draw_color(color);
-            canvas.fill_rect(sdl2::rect::Rect::new(
+            canvas.fill_rect(Rect::new(
                 screen.x as i32 - 8, screen.y as i32 - 8, 16, 16,
             )).ok();
         }
+    }
+
+    // -- Minimap: overview in the bottom-right corner --
+    // The minimap shows the map in top-down grid view (not isometric) since
+    // an isometric minimap would be diamond-shaped and harder to read.
+    // Each tile = 1 pixel, colored by terrain type.
+    if let Some(map) = loaded_map {
+        let (win_w, win_h) = (game.window_width, game.window_height);
+
+        // Scale minimap to fit nicely — 200x202 tiles at 1px each.
+        let mm_w = map.width() as u32;
+        let mm_h = map.active_rows() as u32;
+        let mm_x = win_w as i32 - mm_w as i32 - 15;
+        let mm_y = win_h as i32 - mm_h as i32 - 15;
+
+        // Semi-transparent background
+        canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+        canvas.set_draw_color(Color::RGBA(0, 0, 0, 180));
+        canvas.fill_rect(Rect::new(mm_x - 3, mm_y - 3, mm_w + 6, mm_h + 6)).ok();
+        canvas.set_blend_mode(sdl2::render::BlendMode::None);
+
+        // Draw each tile as a colored pixel based on its sprite index.
+        for ty in 0..map.active_rows() {
+            for tx in 0..map.width() {
+                if let Some(tile) = map.get_tile(tx, ty) {
+                    if tile.is_border { continue; }
+                    let sid = (tile.tile_index & 0x1FF) as u32;
+                    let color = if sid == 0 {
+                        Color::RGB(25, 45, 20)
+                    } else if sid < 50 {
+                        Color::RGB(35, 65, 30)
+                    } else if sid < 150 {
+                        Color::RGB(45, 75, 35)
+                    } else if sid < 250 {
+                        Color::RGB(55, 85, 45)
+                    } else if sid < 350 {
+                        Color::RGB(70, 60, 40)
+                    } else {
+                        Color::RGB(40, 55, 75)
+                    };
+                    canvas.set_draw_color(color);
+                    canvas.draw_point(sdl2::rect::Point::new(
+                        mm_x + tx as i32, mm_y + ty as i32,
+                    )).ok();
+                }
+            }
+        }
+
+        // Player mercs as bright green dots
+        for merc in &game.game_state.team {
+            if let Some(pos) = merc.position {
+                canvas.set_draw_color(Color::RGB(0, 255, 0));
+                canvas.fill_rect(Rect::new(
+                    mm_x + pos.x, mm_y + pos.y, 3, 3,
+                )).ok();
+            }
+        }
+
+        // Border
+        canvas.set_draw_color(Color::RGB(120, 120, 120));
+        canvas.draw_rect(Rect::new(mm_x - 3, mm_y - 3, mm_w + 6, mm_h + 6)).ok();
+
+        // "MINIMAP" label
+        _text.draw_small(canvas, _tc, "MAP", mm_x, mm_y - 14, Color::RGB(180, 180, 180)).ok();
     }
 }
 

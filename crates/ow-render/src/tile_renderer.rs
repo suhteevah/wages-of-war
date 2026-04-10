@@ -221,8 +221,10 @@ impl<'tc> TileMapRenderer<'tc> {
                 }
 
                 // Look up the tile texture by the tile_index from the map data.
-                // The tile_index references a frame in the TIL sprite sheet.
-                let tex_idx = tile.tile_index as usize;
+                // The tile_index encodes the sprite ID in the lower 9 bits
+                // (0-511 for the 512 sprites in the TIL file). The upper bits
+                // encode elevation/variant/object flags which we ignore for now.
+                let tex_idx = (tile.tile_index & 0x1FF) as usize;
                 let texture = match self.tile_textures.get(tex_idx) {
                     Some(Some(tex)) => tex,
                     _ => {
