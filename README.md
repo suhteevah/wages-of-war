@@ -8,7 +8,7 @@ Inspired by [OpenXCOM](https://openxcom.org/), which did the same for *X-COM: UF
 
 ## Status
 
-🚧 **Alpha Development** — Engine core is functional: all game data files parse, combat system works, SDL2 rendering pipeline operational. Not yet playable end-to-end — integration and polish phase.
+🚧 **Alpha — Playable!** The full game loop works: hire mercs from the original 57-merc roster, accept contracts, deploy on real isometric mission maps, move and shoot in tactical combat, complete missions, get paid, take the next contract. Built from scratch in Rust with SDL2. Visuals are placeholder (colored squares for units, correct terrain tiles), but the gameplay loop is functional end-to-end.
 
 ## What This Is
 
