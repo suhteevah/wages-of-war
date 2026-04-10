@@ -146,6 +146,8 @@ pub struct GameLoop {
     pub window_height: u32,
     /// Mission-specific IsoConfig (set when map loads, uses actual tile dimensions).
     pub mission_iso: Option<IsoConfig>,
+    /// Enemy units for the current mission.
+    pub enemies: Vec<ow_core::mission_setup::EnemyUnit>,
 }
 
 impl GameLoop {
@@ -166,6 +168,7 @@ impl GameLoop {
             window_width: WINDOW_WIDTH,
             window_height: WINDOW_HEIGHT,
             mission_iso: None,
+            enemies: Vec::new(),
         }
     }
 }
@@ -504,6 +507,7 @@ pub fn run_game_loop(
                                     next_id += 1;
                                     enemy_units.push(enemy);
                                 }
+                                game.enemies = enemy_units.clone();
                                 info!(enemies = enemy_units.len(), "Enemies generated for mission");
                             }
 
@@ -528,7 +532,7 @@ pub fn run_game_loop(
         canvas.clear();
 
         render_phase(&game, &mut canvas, &text_renderer, &texture_creator, &ruleset, &office_texture,
-                     &tile_renderer, &loaded_map, &mission_iso_config, &enemy_units);
+                     &tile_renderer, &loaded_map, &mission_iso_config);
 
         // Title bar shows the current phase (placeholder for real UI)
         let label = phase_label(&game.phase_handler);
@@ -1191,19 +1195,82 @@ fn handle_combat_input(game: &mut GameLoop, event: &Event) {
                     y: tile.y,
                 };
 
-                // Move the selected unit to the clicked tile.
-                // For now this is a simple teleport — proper pathfinding
-                // with AP costs comes later.
-                info!(
-                    unit_id,
-                    tile_x = target_tile.x,
-                    tile_y = target_tile.y,
-                    "Player moving unit"
-                );
-                if let Some(merc) =
-                    game.game_state.team.iter_mut().find(|m| m.id == unit_id)
-                {
-                    merc.position = Some(target_tile);
+                // Check if an enemy is at or near the clicked tile.
+                // If so, shoot them. Otherwise, move there.
+                let enemy_idx = game.enemies.iter().position(|e| {
+                    e.current_hp > 0 && e.position.map(|p| {
+                        // Click within 2 tiles of an enemy = target them
+                        (p.x - target_tile.x).abs() <= 2 && (p.y - target_tile.y).abs() <= 2
+                    }).unwrap_or(false)
+                });
+
+                if let Some(eidx) = enemy_idx {
+                    // SHOOT — deal damage to the enemy!
+                    let attacker = game.game_state.team.iter().find(|m| m.id == unit_id);
+                    let wsk = attacker.map(|m| m.wsk).unwrap_or(50);
+
+                    // Simple hit chance based on weapon skill.
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    let hit_roll: u32 = rng.gen_range(0..100);
+                    let hit_chance = (wsk as u32).min(95);
+
+                    let enemy = &mut game.enemies[eidx];
+                    if hit_roll < hit_chance {
+                        // Hit! Deal damage based on weapon skill.
+                        let damage = rng.gen_range(5..20);
+                        let old_hp = enemy.current_hp;
+                        enemy.current_hp = enemy.current_hp.saturating_sub(damage);
+                        info!(
+                            shooter = unit_id,
+                            target = %enemy.name,
+                            damage,
+                            old_hp,
+                            new_hp = enemy.current_hp,
+                            "HIT! Damage dealt"
+                        );
+
+                        // Deduct AP for shooting
+                        if let Some(merc) = game.game_state.team.iter_mut().find(|m| m.id == unit_id) {
+                            merc.current_ap = merc.current_ap.saturating_sub(8);
+                        }
+
+                        if enemy.current_hp == 0 {
+                            info!(target = %enemy.name, "Enemy KILLED!");
+                        }
+                    } else {
+                        info!(
+                            shooter = unit_id,
+                            target = %enemy.name,
+                            roll = hit_roll,
+                            needed = hit_chance,
+                            "MISS!"
+                        );
+                        // Still costs AP to shoot
+                        if let Some(merc) = game.game_state.team.iter_mut().find(|m| m.id == unit_id) {
+                            merc.current_ap = merc.current_ap.saturating_sub(8);
+                        }
+                    }
+                } else {
+                    // MOVE — teleport to the clicked tile, deduct AP.
+                    if let Some(merc) = game.game_state.team.iter_mut().find(|m| m.id == unit_id) {
+                        // Simple AP cost: 2 per tile (Manhattan distance).
+                        let cost = if let Some(old_pos) = merc.position {
+                            let dist = (old_pos.x - target_tile.x).unsigned_abs()
+                                + (old_pos.y - target_tile.y).unsigned_abs();
+                            (dist * 2).min(merc.current_ap)
+                        } else {
+                            2
+                        };
+                        merc.current_ap = merc.current_ap.saturating_sub(cost);
+                        merc.position = Some(target_tile);
+                        info!(
+                            name = %merc.name,
+                            ap_cost = cost,
+                            remaining_ap = merc.current_ap,
+                            "Unit moved"
+                        );
+                    }
                 }
             }
         }
@@ -1466,16 +1533,15 @@ fn render_phase(
     tile_renderer: &Option<ow_render::tile_renderer::TileMapRenderer>,
     loaded_map: &Option<ow_data::map_loader::GameMap>,
     mission_iso: &Option<IsoConfig>,
-    enemy_units: &[ow_core::mission_setup::EnemyUnit],
-) {
+    ) {
     match &game.phase_handler {
         PhaseHandler::Office { sub_phase } => render_office(game, canvas, *sub_phase, text, tc, ruleset, office_bg),
         PhaseHandler::Travel { elapsed_ms } => render_travel(canvas, *elapsed_ms, text, tc),
-        PhaseHandler::Deployment { selected_unit } => {
-            render_mission_map(game, canvas, tile_renderer, loaded_map, mission_iso, text, tc, &enemy_units);
+        PhaseHandler::Deployment { .. } => {
+            render_mission_map(game, canvas, tile_renderer, loaded_map, mission_iso, text, tc, &game.enemies);
         }
-        PhaseHandler::Combat(combat) => {
-            render_mission_map(game, canvas, tile_renderer, loaded_map, mission_iso, text, tc, &enemy_units);
+        PhaseHandler::Combat(_) => {
+            render_mission_map(game, canvas, tile_renderer, loaded_map, mission_iso, text, tc, &game.enemies);
         }
         PhaseHandler::Extraction => render_extraction(game, canvas),
         PhaseHandler::Debrief { success } => render_debrief(canvas, *success, text, tc),
