@@ -302,6 +302,12 @@ pub fn run_game_loop(
         }
     };
 
+    // -- Mission map resources (loaded when entering deployment) --
+    // These are Option because they don't exist until a mission starts.
+    let mut tile_renderer: Option<ow_render::tile_renderer::TileMapRenderer> = None;
+    let mut loaded_map: Option<ow_data::map_loader::GameMap> = None;
+    let mut mission_iso_config: Option<IsoConfig> = None;
+
     let mut last_frame = Instant::now();
     let mut running = true;
     let mut _screenshot_count = 0u32;
@@ -360,6 +366,87 @@ pub fn run_game_loop(
         // -- Update --
         update_phase(&mut game, delta_ms);
 
+        // -- Load mission map when entering deployment for the first time --
+        // We check if we just transitioned to Deployment and haven't loaded a map yet.
+        if matches!(game.phase_handler, PhaseHandler::Deployment { .. }) && loaded_map.is_none() {
+            // Determine which mission scenario to load from the accepted contract.
+            let mission_num = game.game_state.current_mission.as_ref()
+                .and_then(|m| m.name.strip_prefix("MSSN"))
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(1);
+
+            info!(mission = mission_num, "Loading mission map for deployment");
+
+            // Load MAP file from WOW/MAPS/SCEN{n}/
+            // Try SCEN{n}.MAP first, then SCEN{n}A.MAP (the actual filename varies).
+            let scen_dir = data_dir.join("WOW").join("MAPS").join(format!("SCEN{mission_num}"));
+            let map_path = {
+                let try1 = scen_dir.join(format!("SCEN{mission_num}.MAP"));
+                let try2 = scen_dir.join(format!("SCEN{mission_num}A.MAP"));
+                if try1.exists() { try1 } else { try2 }
+            };
+
+            match ow_data::map_loader::parse_map(&map_path) {
+                Ok(map) => {
+                    info!(width = map.width(), height = map.height(),
+                          tileset = %map.asset_refs.tileset_path, "Map loaded");
+
+                    // Load the TIL tileset referenced by the MAP's string table.
+                    // The MAP references paths like "C:\WOW\SPR\SCEN1\TILSCN01.TIL".
+                    // The TIL files live in WOW/SPR/SCEN{n}/, not WOW/MAPS/SCEN{n}/.
+                    let til_name = ow_data::map_loader::filename_from_build_path(
+                        &map.asset_refs.tileset_path);
+                    let spr_scen_dir = data_dir.join("WOW").join("SPR")
+                        .join(format!("SCEN{mission_num}"));
+                    let til_path = spr_scen_dir.join(til_name);
+                    match ow_data::sprite::parse_sprite_file(&til_path) {
+                        Ok(tileset) => {
+                            info!(sprites = tileset.file_header.sprite_count, "Tileset loaded");
+
+                            // Load palette from a PCX file.
+                            let pic_dir = data_dir.join("WOW").join("PIC");
+                            if let Ok(entries) = std::fs::read_dir(&pic_dir) {
+                                for entry in entries.flatten() {
+                                    if entry.path().extension().map(|e| e.to_ascii_uppercase())
+                                        == Some("PCX".into())
+                                    {
+                                        match ow_render::palette::load_pcx_palette(&entry.path()) {
+                                            Ok(pal) => {
+                                                // Create tile renderer and load textures.
+                                                let mut tr = ow_render::tile_renderer::TileMapRenderer::new(&texture_creator);
+                                                if let Err(e) = tr.load_tileset(&tileset, &pal) {
+                                                    warn!("Failed to load tileset textures: {e}");
+                                                } else {
+                                                    let tw = tr.tile_pixel_width() as f32;
+                                                    let th = tr.tile_pixel_height() as f32;
+                                                    info!(tile_w = tw, tile_h = th,
+                                                          tiles = tr.tile_count(), "Tiles ready");
+
+                                                    // Configure iso projection for these tile dimensions.
+                                                    mission_iso_config = Some(IsoConfig {
+                                                        tile_width: tw,
+                                                        tile_height: th / 2.0,
+                                                        origin_x: (game.window_width as f32) / 2.0,
+                                                        origin_y: 50.0,
+                                                    });
+                                                    tile_renderer = Some(tr);
+                                                }
+                                                break;
+                                            }
+                                            Err(e) => warn!("Palette error: {e}"),
+                                        }
+                                    }
+                                }
+                            }
+                            loaded_map = Some(map);
+                        }
+                        Err(e) => warn!("Failed to load tileset {til_name}: {e}"),
+                    }
+                }
+                Err(e) => warn!("Failed to load map {}: {e}", map_path.display()),
+            }
+        }
+
         // -- Update window dimensions every frame (handles fullscreen, DPI changes,
         // and resize events we might miss). Cheap call, prevents coordinate bugs. --
         let (cw, ch) = canvas.window().size();
@@ -371,7 +458,8 @@ pub fn run_game_loop(
         canvas.set_draw_color(bg);
         canvas.clear();
 
-        render_phase(&game, &mut canvas, &text_renderer, &texture_creator, &ruleset, &office_texture);
+        render_phase(&game, &mut canvas, &text_renderer, &texture_creator, &ruleset, &office_texture,
+                     &tile_renderer, &loaded_map, &mission_iso_config);
 
         // Title bar shows the current phase (placeholder for real UI)
         let label = phase_label(&game.phase_handler);
@@ -1291,14 +1379,19 @@ fn render_phase(
     tc: &TextureCreator<WindowContext>,
     ruleset: &Ruleset,
     office_bg: &Option<Texture>,
+    tile_renderer: &Option<ow_render::tile_renderer::TileMapRenderer>,
+    loaded_map: &Option<ow_data::map_loader::GameMap>,
+    mission_iso: &Option<IsoConfig>,
 ) {
     match &game.phase_handler {
         PhaseHandler::Office { sub_phase } => render_office(game, canvas, *sub_phase, text, tc, ruleset, office_bg),
         PhaseHandler::Travel { elapsed_ms } => render_travel(canvas, *elapsed_ms, text, tc),
         PhaseHandler::Deployment { selected_unit } => {
-            render_deployment(game, canvas, *selected_unit)
+            render_mission_map(game, canvas, tile_renderer, loaded_map, mission_iso, text, tc);
         }
-        PhaseHandler::Combat(combat) => render_combat(game, canvas, combat),
+        PhaseHandler::Combat(combat) => {
+            render_mission_map(game, canvas, tile_renderer, loaded_map, mission_iso, text, tc);
+        }
         PhaseHandler::Extraction => render_extraction(game, canvas),
         PhaseHandler::Debrief { success } => render_debrief(canvas, *success, text, tc),
         PhaseHandler::Paused { .. } => render_pause(canvas, text, tc),
@@ -1566,6 +1659,41 @@ fn render_travel(canvas: &mut Canvas<Window>, elapsed_ms: u32, _text: &TextRende
 // ---------------------------------------------------------------------------
 
 /// Render the deployment screen: placeholder grid + placed merc markers.
+/// Render the mission map using real tile sprites if loaded, or the placeholder grid.
+/// Used by both Deployment and Combat phases.
+fn render_mission_map(
+    game: &GameLoop,
+    canvas: &mut Canvas<Window>,
+    tile_renderer: &Option<ow_render::tile_renderer::TileMapRenderer>,
+    loaded_map: &Option<ow_data::map_loader::GameMap>,
+    mission_iso: &Option<IsoConfig>,
+    _text: &TextRenderer,
+    _tc: &TextureCreator<WindowContext>,
+) {
+    // If we have real tile data, render the actual map. Otherwise fall back
+    // to the wireframe placeholder grid.
+    if let (Some(tr), Some(map), Some(iso)) = (tile_renderer, loaded_map, mission_iso) {
+        tr.render_map(canvas, map, &game.camera, iso);
+    } else {
+        render_placeholder_grid(canvas, &game.camera, &game.iso_config);
+    }
+
+    // Draw placed mercs as colored squares on the map.
+    let iso = mission_iso.as_ref().unwrap_or(&game.iso_config);
+    for (i, merc) in game.game_state.team.iter().enumerate() {
+        if let Some(pos) = merc.position {
+            let iso_tile = TilePos { x: pos.x, y: pos.y };
+            let world = iso.tile_to_screen(iso_tile);
+            let screen = game.camera.world_to_screen(world);
+            let color = Color::RGB(0, 200, 0);
+            canvas.set_draw_color(color);
+            canvas.fill_rect(sdl2::rect::Rect::new(
+                screen.x as i32 - 8, screen.y as i32 - 8, 16, 16,
+            )).ok();
+        }
+    }
+}
+
 fn render_deployment(game: &GameLoop, canvas: &mut Canvas<Window>, selected_unit: usize) {
     render_placeholder_grid(canvas, &game.camera, &game.iso_config);
 
