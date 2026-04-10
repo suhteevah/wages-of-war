@@ -9,9 +9,10 @@ pub mod damage;
 pub mod weather;
 pub mod game_state;
 
+pub mod pathfinding;
+pub mod los;
+
 // TODO: Future modules
 // pub mod ai;
 // pub mod economy;
 // pub mod map;
-// pub mod pathfinding;
-// pub mod los;

@@ -11,3 +11,11 @@ ow-data = { path = "../ow-data" }
 sdl2 = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+# Only needed by the sprite-viewer binary, but harmless as lib deps.
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "sprite-viewer"
+path = "src/bin/sprite_viewer.rs"

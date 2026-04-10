@@ -20,6 +20,8 @@
 //! - [`target`] — Hit location probability table (TARGET.DAT)
 //! - [`textrect`] — Text rectangle / UI text layout (TEXTRECT*.DAT)
 //! - [`sprite`] — Binary sprite container format (.OBJ, .SPR, .TIL, ANIM .DAT)
+//! - [`palette`] — PCX palette extraction (256-color VGA palette)
+//! - [`map_loader`] — Binary MAP file parser (tile grids, asset refs)
 
 pub mod dat_parser;
 pub mod validator;
@@ -37,3 +39,5 @@ pub mod animation;
 pub mod target;
 pub mod textrect;
 pub mod sprite;
+pub mod palette;
+pub mod map_loader;

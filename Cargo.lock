@@ -397,10 +397,12 @@ name = "ow-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "ow-core",
  "ow-data",
  "sdl2",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

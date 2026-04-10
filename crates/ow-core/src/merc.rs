@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
 /// Tile position on the isometric map grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TilePos {
     pub x: i32,
     pub y: i32,
