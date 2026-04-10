@@ -20,3 +20,4 @@ pub mod unit_renderer;
 pub mod hud;
 pub mod ui;
 pub mod text;
+pub mod pcx;

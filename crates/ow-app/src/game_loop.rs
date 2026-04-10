@@ -35,7 +35,7 @@ use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
-use sdl2::render::{Canvas, TextureCreator};
+use sdl2::render::{Canvas, Texture, TextureCreator};
 use sdl2::video::{Window, WindowContext};
 use sdl2::Sdl;
 use tracing::{debug, info, trace, warn};
@@ -260,6 +260,7 @@ pub fn run_game_loop(
     mut canvas: Canvas<Window>,
     game_state: GameState,
     ruleset: Ruleset,
+    data_dir: &std::path::Path,
 ) -> Result<()> {
     info!(phase = ?game_state.phase, "Starting game loop");
 
@@ -275,8 +276,30 @@ pub fn run_game_loop(
         .map_err(|e| anyhow::anyhow!("Font loading failed: {e}"))?;
     let texture_creator = canvas.texture_creator();
 
+    // Load the office background image — OFFICE.PCX is the main HQ screen.
+    // The original game renders this as a 640x480 scene with clickable objects
+    // (phone, fax, filing cabinet, pizza, etc.) overlaid on the background.
+    let office_texture = {
+        // OFFICE.PCX is the base layer of the office scene. The original engine
+        // composites OBJ sprites on top for the interactive objects (phone, fax, etc.).
+        // OFFPIC2.PCX is a pre-composited version with all objects baked in.
+        // We use OFFPIC2 for now; proper compositing comes later.
+        let pcx_path = data_dir.join("WOW").join("PIC").join("OFFPIC2.PCX");
+        match ow_render::pcx::load_pcx(&pcx_path) {
+            Ok(img) => {
+                info!(width = img.width, height = img.height, "Office background loaded");
+                match ow_render::pcx::pcx_to_texture(&img, &texture_creator) {
+                    Ok(tex) => Some(tex),
+                    Err(e) => { warn!("Failed to create office texture: {e}"); None }
+                }
+            }
+            Err(e) => { warn!("Failed to load OFFICE.PCX: {e}"); None }
+        }
+    };
+
     let mut last_frame = Instant::now();
     let mut running = true;
+    let mut screenshot_taken = false;
 
     // -----------------------------------------------------------------------
     // Main loop: poll events -> update -> render -> present -> sleep
@@ -323,7 +346,7 @@ pub fn run_game_loop(
         canvas.set_draw_color(bg);
         canvas.clear();
 
-        render_phase(&game, &mut canvas, &text_renderer, &texture_creator, &ruleset);
+        render_phase(&game, &mut canvas, &text_renderer, &texture_creator, &ruleset, &office_texture);
 
         // Title bar shows the current phase (placeholder for real UI)
         let label = phase_label(&game.phase_handler);
@@ -333,6 +356,28 @@ pub fn run_game_loop(
             .ok();
 
         canvas.present();
+
+        // Auto-save a debug screenshot on the 3rd frame (after rendering stabilizes).
+        // F12 also saves a screenshot at any time.
+        if !screenshot_taken {
+            screenshot_taken = true;
+            // Read pixels back from the canvas and save as BMP.
+            let (sw, sh) = canvas.output_size().unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
+            let pixel_format = canvas.default_pixel_format();
+            if let Ok(pixels) = canvas.read_pixels(None, pixel_format) {
+                if let Ok(surface) = sdl2::surface::Surface::from_data(
+                    &mut pixels.clone(),
+                    sw, sh,
+                    sw * 4,
+                    sdl2::pixels::PixelFormatEnum::ARGB8888,
+                ) {
+                    let path = std::path::Path::new("debug_screenshot.bmp");
+                    if surface.save_bmp(path).is_ok() {
+                        info!("Debug screenshot saved to debug_screenshot.bmp");
+                    }
+                }
+            }
+        }
 
         // -- Frame pacing --
         // Sleep for remaining frame budget to hit ~60 fps.
@@ -1009,9 +1054,10 @@ fn render_phase(
     text: &TextRenderer,
     tc: &TextureCreator<WindowContext>,
     ruleset: &Ruleset,
+    office_bg: &Option<Texture>,
 ) {
     match &game.phase_handler {
-        PhaseHandler::Office { sub_phase } => render_office(game, canvas, *sub_phase, text, tc, ruleset),
+        PhaseHandler::Office { sub_phase } => render_office(game, canvas, *sub_phase, text, tc, ruleset, office_bg),
         PhaseHandler::Travel { elapsed_ms } => render_travel(canvas, *elapsed_ms, text, tc),
         PhaseHandler::Deployment { selected_unit } => {
             render_deployment(game, canvas, *selected_unit)
@@ -1038,9 +1084,40 @@ fn render_office(
     text: &TextRenderer,
     tc: &TextureCreator<WindowContext>,
     ruleset: &Ruleset,
+    office_bg: &Option<Texture>,
 ) {
     let (w, h) = canvas.output_size().unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
 
+    // -- For the Overview tab, render the original OFFICE.PCX background --
+    // This is the iconic desk scene the player sees when the game starts.
+    // Other sub-phases overlay their own content on a dark background.
+    match active_sub {
+        OfficePhase::Overview => {
+            if let Some(bg_tex) = office_bg {
+                // Scale the 640x480 office background to fill the window.
+                canvas.copy(bg_tex, None, Some(Rect::new(0, 0, w, h))).ok();
+            }
+
+            // Overlay help text on the office background.
+            // Semi-transparent bar at bottom for readability.
+            canvas.set_draw_color(Color::RGBA(0, 0, 0, 180));
+            canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+            canvas.fill_rect(Rect::new(0, (h - 55) as i32, w, 55)).ok();
+            canvas.set_blend_mode(sdl2::render::BlendMode::None);
+
+            let funds_text = format!("Funds: ${:>12}  |  Team: {}/8  |  Missions: {}",
+                game.game_state.funds, game.game_state.team.len(), game.game_state.missions_completed);
+            text.draw(canvas, tc, &funds_text, 15, (h - 45) as i32, Color::RGB(220, 220, 220)).ok();
+            text.draw_small(canvas, tc,
+                "1:Hire  2:Equip  3:Intel  4:Contracts  5:Train  |  B:Begin Mission  |  ESC:Quit",
+                15, (h - 22) as i32, Color::RGB(160, 160, 180)).ok();
+
+            return; // Overview renders the background only — no tab bar.
+        }
+        _ => {}
+    }
+
+    // -- For non-Overview tabs, dark background with tab bar --
     // -- Status bar at bottom: shows funds and team size --
     canvas.set_draw_color(Color::RGB(20, 20, 30));
     canvas.fill_rect(Rect::new(0, (h - 50) as i32, w, 50)).ok();
@@ -1049,9 +1126,9 @@ fn render_office(
     text.draw(canvas, tc, &funds_text, 15, (h - 35) as i32, Color::RGB(200, 200, 200)).ok();
 
     // -- Sub-phase tab bar along the top --
-    let tab_names = ["1:Overview", "2:Hire", "3:Equip", "4:Intel", "5:Contracts", "6:Train"];
+    let tab_names = ["1:Hire", "2:Equip", "3:Intel", "4:Contracts", "5:Train"];
     let sub_phases = [
-        OfficePhase::Overview, OfficePhase::HireMercs, OfficePhase::Equipment,
+        OfficePhase::HireMercs, OfficePhase::Equipment,
         OfficePhase::Intel, OfficePhase::Contracts, OfficePhase::Training,
     ];
 
@@ -1059,8 +1136,11 @@ fn render_office(
     canvas.set_draw_color(Color::RGB(15, 15, 25));
     canvas.fill_rect(Rect::new(0, 0, w, 35)).ok();
 
+    // Back to office button
+    text.draw_small(canvas, tc, "[ESC] Office", 10, 10, Color::RGB(140, 140, 160)).ok();
+
     for (i, (sp, name)) in sub_phases.iter().zip(tab_names.iter()).enumerate() {
-        let x = 10 + (i as i32) * 130;
+        let x = 130 + (i as i32) * 130;
         let active = *sp == active_sub;
         let bg = if active { Color::RGB(60, 60, 100) } else { Color::RGB(30, 30, 45) };
         let fg = if active { Color::RGB(255, 255, 200) } else { Color::RGB(140, 140, 140) };
@@ -1075,14 +1155,7 @@ fn render_office(
 
     match active_sub {
         OfficePhase::Overview => {
-            text.draw_header(canvas, tc, "MERCS, Inc. — Headquarters", 20, content_y, Color::RGB(220, 200, 100)).ok();
-            text.draw(canvas, tc, "Welcome to the office. Select a tab to manage your operation.", 20, content_y + 35, Color::RGB(180, 180, 180)).ok();
-            text.draw(canvas, tc, "Press B to begin mission (requires hired mercs)", 20, content_y + 60, Color::RGB(140, 140, 140)).ok();
-
-            // Show mission progress
-            if game.game_state.missions_completed == 0 {
-                text.draw(canvas, tc, "No missions completed yet. Accept a contract and deploy!", 20, content_y + 100, Color::RGB(200, 160, 80)).ok();
-            }
+            // Handled above with the background image.
         }
         OfficePhase::HireMercs => {
             text.draw_header(canvas, tc, "Mercenary Roster", 20, content_y, Color::RGB(220, 200, 100)).ok();
