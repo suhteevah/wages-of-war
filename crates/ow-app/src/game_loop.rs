@@ -34,8 +34,9 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::Color;
-use sdl2::render::Canvas;
-use sdl2::video::Window;
+use sdl2::rect::Rect;
+use sdl2::render::{Canvas, TextureCreator};
+use sdl2::video::{Window, WindowContext};
 use sdl2::Sdl;
 use tracing::{debug, info, trace, warn};
 
@@ -43,8 +44,10 @@ use ow_core::actions::Action;
 use ow_core::game_state::{GamePhase, GameState, MissionPhase, OfficePhase};
 use ow_core::merc::MercId;
 
+use ow_core::ruleset::Ruleset;
 use ow_render::camera::Camera;
 use ow_render::iso_math::{IsoConfig, ScreenPos, TilePos};
+use ow_render::text::TextRenderer;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -256,6 +259,7 @@ pub fn run_game_loop(
     sdl_context: &Sdl,
     mut canvas: Canvas<Window>,
     game_state: GameState,
+    ruleset: Ruleset,
 ) -> Result<()> {
     info!(phase = ?game_state.phase, "Starting game loop");
 
@@ -263,6 +267,13 @@ pub fn run_game_loop(
     let mut event_pump = sdl_context
         .event_pump()
         .map_err(|e| anyhow::anyhow!("Failed to get SDL2 event pump: {e}"))?;
+
+    // Initialize text rendering — loads a system font for UI text.
+    let ttf_context = sdl2::ttf::init()
+        .map_err(|e| anyhow::anyhow!("SDL2_ttf init failed: {e}"))?;
+    let text_renderer = TextRenderer::new(&ttf_context, None)
+        .map_err(|e| anyhow::anyhow!("Font loading failed: {e}"))?;
+    let texture_creator = canvas.texture_creator();
 
     let mut last_frame = Instant::now();
     let mut running = true;
@@ -312,7 +323,7 @@ pub fn run_game_loop(
         canvas.set_draw_color(bg);
         canvas.clear();
 
-        render_phase(&game, &mut canvas);
+        render_phase(&game, &mut canvas, &text_renderer, &texture_creator, &ruleset);
 
         // Title bar shows the current phase (placeholder for real UI)
         let label = phase_label(&game.phase_handler);
@@ -992,17 +1003,23 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32) {
 ///
 /// Most phases render a colored background (set in the main loop) with
 /// geometric placeholders. Combat renders an isometric grid plus unit markers.
-fn render_phase(game: &GameLoop, canvas: &mut Canvas<Window>) {
+fn render_phase(
+    game: &GameLoop,
+    canvas: &mut Canvas<Window>,
+    text: &TextRenderer,
+    tc: &TextureCreator<WindowContext>,
+    ruleset: &Ruleset,
+) {
     match &game.phase_handler {
-        PhaseHandler::Office { sub_phase } => render_office(game, canvas, *sub_phase),
-        PhaseHandler::Travel { elapsed_ms } => render_travel(canvas, *elapsed_ms),
+        PhaseHandler::Office { sub_phase } => render_office(game, canvas, *sub_phase, text, tc, ruleset),
+        PhaseHandler::Travel { elapsed_ms } => render_travel(canvas, *elapsed_ms, text, tc),
         PhaseHandler::Deployment { selected_unit } => {
             render_deployment(game, canvas, *selected_unit)
         }
         PhaseHandler::Combat(combat) => render_combat(game, canvas, combat),
         PhaseHandler::Extraction => render_extraction(game, canvas),
-        PhaseHandler::Debrief { success } => render_debrief(canvas, *success),
-        PhaseHandler::Paused { .. } => render_pause(canvas),
+        PhaseHandler::Debrief { success } => render_debrief(canvas, *success, text, tc),
+        PhaseHandler::Paused { .. } => render_pause(canvas, text, tc),
     }
 }
 
@@ -1014,64 +1031,146 @@ fn render_phase(game: &GameLoop, canvas: &mut Canvas<Window>) {
 ///
 /// Placeholder: colored background per sub-phase, tab indicators at top,
 /// team size / funds indicators at bottom.
-fn render_office(game: &GameLoop, canvas: &mut Canvas<Window>, active_sub: OfficePhase) {
+fn render_office(
+    game: &GameLoop,
+    canvas: &mut Canvas<Window>,
+    active_sub: OfficePhase,
+    text: &TextRenderer,
+    tc: &TextureCreator<WindowContext>,
+    ruleset: &Ruleset,
+) {
     let (w, h) = canvas.output_size().unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
 
-    // Status bar at bottom
-    canvas.set_draw_color(Color::RGB(0, 0, 0));
-    canvas
-        .fill_rect(sdl2::rect::Rect::new(0, (h - 40) as i32, w, 40))
-        .ok();
+    // -- Status bar at bottom: shows funds and team size --
+    canvas.set_draw_color(Color::RGB(20, 20, 30));
+    canvas.fill_rect(Rect::new(0, (h - 50) as i32, w, 50)).ok();
+    let funds_text = format!("Funds: ${:>12}  |  Team: {}/8  |  Missions: {}",
+        game.game_state.funds, game.game_state.team.len(), game.game_state.missions_completed);
+    text.draw(canvas, tc, &funds_text, 15, (h - 35) as i32, Color::RGB(200, 200, 200)).ok();
 
-    // Sub-phase tab indicators along the top
+    // -- Sub-phase tab bar along the top --
+    let tab_names = ["1:Overview", "2:Hire", "3:Equip", "4:Intel", "5:Contracts", "6:Train"];
     let sub_phases = [
-        OfficePhase::Overview,
-        OfficePhase::HireMercs,
-        OfficePhase::Equipment,
-        OfficePhase::Intel,
-        OfficePhase::Contracts,
-        OfficePhase::Training,
+        OfficePhase::Overview, OfficePhase::HireMercs, OfficePhase::Equipment,
+        OfficePhase::Intel, OfficePhase::Contracts, OfficePhase::Training,
     ];
-    let block_w: i32 = 80;
-    let block_h: u32 = 20;
 
-    for (i, sp) in sub_phases.iter().enumerate() {
-        let color = if *sp == active_sub {
-            Color::RGB(200, 200, 50) // bright yellow for active tab
-        } else {
-            Color::RGB(80, 80, 80) // dim gray for inactive
-        };
-        canvas.set_draw_color(color);
-        canvas
-            .fill_rect(sdl2::rect::Rect::new(
-                10 + (i as i32) * (block_w + 5),
-                10,
-                block_w as u32,
-                block_h,
-            ))
-            .ok();
+    // Tab background
+    canvas.set_draw_color(Color::RGB(15, 15, 25));
+    canvas.fill_rect(Rect::new(0, 0, w, 35)).ok();
+
+    for (i, (sp, name)) in sub_phases.iter().zip(tab_names.iter()).enumerate() {
+        let x = 10 + (i as i32) * 130;
+        let active = *sp == active_sub;
+        let bg = if active { Color::RGB(60, 60, 100) } else { Color::RGB(30, 30, 45) };
+        let fg = if active { Color::RGB(255, 255, 200) } else { Color::RGB(140, 140, 140) };
+        canvas.set_draw_color(bg);
+        canvas.fill_rect(Rect::new(x, 5, 120, 25)).ok();
+        text.draw_small(canvas, tc, name, x + 8, 10, fg).ok();
     }
 
-    // Team size indicator: small squares per hired merc
-    let team_size = game.game_state.team.len();
-    for i in 0..team_size {
-        canvas.set_draw_color(Color::RGB(100, 200, 100));
-        canvas
-            .fill_rect(sdl2::rect::Rect::new(
-                10 + (i as i32) * 20,
-                (h - 30) as i32,
-                15,
-                15,
-            ))
-            .ok();
+    // -- Main content area depends on active sub-phase --
+    let content_y = 50;
+    let content_h = h as i32 - 50 - 55;
+
+    match active_sub {
+        OfficePhase::Overview => {
+            text.draw_header(canvas, tc, "MERCS, Inc. — Headquarters", 20, content_y, Color::RGB(220, 200, 100)).ok();
+            text.draw(canvas, tc, "Welcome to the office. Select a tab to manage your operation.", 20, content_y + 35, Color::RGB(180, 180, 180)).ok();
+            text.draw(canvas, tc, "Press B to begin mission (requires hired mercs)", 20, content_y + 60, Color::RGB(140, 140, 140)).ok();
+
+            // Show mission progress
+            if game.game_state.missions_completed == 0 {
+                text.draw(canvas, tc, "No missions completed yet. Accept a contract and deploy!", 20, content_y + 100, Color::RGB(200, 160, 80)).ok();
+            }
+        }
+        OfficePhase::HireMercs => {
+            text.draw_header(canvas, tc, "Mercenary Roster", 20, content_y, Color::RGB(220, 200, 100)).ok();
+
+            // List available mercs from the ruleset, scrollable
+            let mut y = content_y + 35;
+            let mut count = 0;
+            let mut sorted_mercs: Vec<_> = ruleset.mercs.values().collect();
+            sorted_mercs.sort_by(|a, b| b.rating.cmp(&a.rating)); // best first
+
+            for merc in sorted_mercs.iter().take(25) {
+                // Check if already hired
+                let hired = game.game_state.team.iter().any(|m| m.name == merc.name);
+                let status_color = if hired {
+                    Color::RGB(100, 200, 100) // green = on your team
+                } else if merc.avail == 1 {
+                    Color::RGB(200, 200, 200) // white = available
+                } else {
+                    Color::RGB(100, 100, 100) // gray = unavailable
+                };
+
+                let status_tag = if hired { "[HIRED]" } else if merc.avail == 0 { "[N/A]" } else { "" };
+                let line = format!(
+                    "{:<25} RAT:{:>3}  EXP:{:>3}  WSK:{:>3}  AGL:{:>3}  Hire:${:>7}  {}",
+                    merc.name, merc.rating, merc.exp, merc.wsk, merc.agl, merc.fee_hire, status_tag
+                );
+                text.draw_small(canvas, tc, &line, 20, y, status_color).ok();
+                y += 16;
+                count += 1;
+                if y > (content_y + content_h - 20) { break; }
+            }
+
+            text.draw_small(canvas, tc,
+                &format!("Showing {count}/{} mercs (sorted by rating)", ruleset.mercs.len()),
+                20, content_y + content_h, Color::RGB(100, 100, 100),
+            ).ok();
+        }
+        OfficePhase::Equipment => {
+            text.draw_header(canvas, tc, "Equipment Catalog", 20, content_y, Color::RGB(220, 200, 100)).ok();
+            let mut y = content_y + 35;
+
+            // Show weapons
+            text.draw(canvas, tc, "--- WEAPONS ---", 20, y, Color::RGB(180, 140, 80)).ok();
+            y += 22;
+            let mut sorted_weapons: Vec<_> = ruleset.weapons.values().collect();
+            sorted_weapons.sort_by_key(|w| format!("{:?}", w.weapon_type));
+            for w in sorted_weapons.iter().take(20) {
+                let line = format!(
+                    "{:<25} RNG:{:>3}  DMG:{:>2}  PEN:{:>3}  AP:{:>3}  ${:>6}",
+                    w.name, w.weapon_range, w.damage_class, w.penetration, w.ap_cost, w.cost
+                );
+                text.draw_small(canvas, tc, &line, 20, y, Color::RGB(200, 200, 200)).ok();
+                y += 14;
+                if y > (content_y + content_h - 20) { break; }
+            }
+        }
+        OfficePhase::Contracts => {
+            text.draw_header(canvas, tc, "Available Contracts", 20, content_y, Color::RGB(220, 200, 100)).ok();
+            let mut y = content_y + 35;
+
+            // Show mission contracts from the ruleset
+            let mut mission_ids: Vec<_> = ruleset.missions.keys().collect();
+            mission_ids.sort();
+            for mid in &mission_ids {
+                if let Some(mission) = ruleset.missions.get(*mid) {
+                    let line = format!(
+                        "{}: {} — Advance: ${}, Bonus: ${}",
+                        mid, mission.contract.terms, mission.contract.advance, mission.contract.bonus
+                    );
+                    // Truncate long lines
+                    let display = if line.len() > 120 { &line[..120] } else { &line };
+                    text.draw_small(canvas, tc, display, 20, y, Color::RGB(200, 200, 200)).ok();
+                    y += 18;
+                    if y > (content_y + content_h - 20) { break; }
+                }
+            }
+        }
+        _ => {
+            // Intel, Training — placeholder for now
+            let label = format!("{:?}", active_sub);
+            text.draw_header(canvas, tc, &label, 20, content_y, Color::RGB(220, 200, 100)).ok();
+            text.draw(canvas, tc, "Coming soon...", 20, content_y + 35, Color::RGB(140, 140, 140)).ok();
+        }
     }
 
-    trace!(
-        sub_phase = ?active_sub,
-        funds = game.game_state.funds,
-        team_size,
-        "Rendered office screen"
-    );
+    // -- Help text --
+    text.draw_small(canvas, tc, "ESC: Pause  |  B: Begin Mission",
+        (w - 280) as i32, (h - 35) as i32, Color::RGB(100, 100, 120)).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,7 +1178,7 @@ fn render_office(game: &GameLoop, canvas: &mut Canvas<Window>, active_sub: Offic
 // ---------------------------------------------------------------------------
 
 /// Render the travel screen — a simple progress bar.
-fn render_travel(canvas: &mut Canvas<Window>, elapsed_ms: u32) {
+fn render_travel(canvas: &mut Canvas<Window>, elapsed_ms: u32, _text: &TextRenderer, _tc: &TextureCreator<WindowContext>) {
     let (w, h) = canvas.output_size().unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
     let progress = (elapsed_ms as f32 / 2000.0).min(1.0);
     let bar_width = (w as f32 * 0.6) as u32;
@@ -1265,7 +1364,7 @@ fn render_extraction(game: &GameLoop, canvas: &mut Canvas<Window>) {
 // ---------------------------------------------------------------------------
 
 /// Render the debrief screen: large result indicator + "press enter" prompt.
-fn render_debrief(canvas: &mut Canvas<Window>, success: bool) {
+fn render_debrief(canvas: &mut Canvas<Window>, success: bool, _text: &TextRenderer, _tc: &TextureCreator<WindowContext>) {
     let (w, h) = canvas.output_size().unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
 
     let color = if success {
@@ -1303,7 +1402,7 @@ fn render_debrief(canvas: &mut Canvas<Window>, success: bool) {
 // ---------------------------------------------------------------------------
 
 /// Render the pause overlay: dark fill + pause icon (two vertical bars).
-fn render_pause(canvas: &mut Canvas<Window>) {
+fn render_pause(canvas: &mut Canvas<Window>, _text: &TextRenderer, _tc: &TextureCreator<WindowContext>) {
     let (w, h) = canvas.output_size().unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
 
     // Dark overlay

@@ -111,7 +111,7 @@ fn main() -> anyhow::Result<()> {
     let game_state = ow_core::game_state::GameState::new(500_000);
     info!(phase = ?game_state.phase, "Entering game loop");
 
-    game_loop::run_game_loop(&sdl_context, canvas, game_state)?;
+    game_loop::run_game_loop(&sdl_context, canvas, game_state, ruleset)?;
 
     info!("Open Wages shutting down cleanly");
     Ok(())

@@ -19,3 +19,4 @@ pub mod anim_controller;
 pub mod unit_renderer;
 pub mod hud;
 pub mod ui;
+pub mod text;
