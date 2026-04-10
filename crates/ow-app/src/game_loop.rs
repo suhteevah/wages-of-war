@@ -144,6 +144,8 @@ pub struct GameLoop {
     /// Current window dimensions (updated on resize).
     pub window_width: u32,
     pub window_height: u32,
+    /// Mission-specific IsoConfig (set when map loads, uses actual tile dimensions).
+    pub mission_iso: Option<IsoConfig>,
 }
 
 impl GameLoop {
@@ -163,6 +165,7 @@ impl GameLoop {
             phase_handler,
             window_width: WINDOW_WIDTH,
             window_height: WINDOW_HEIGHT,
+            mission_iso: None,
         }
     }
 }
@@ -428,12 +431,19 @@ pub fn run_game_loop(
                                                     // vertically to create the seamless diamond pattern.
                                                     // tile_width = sprite width (horizontal step between columns)
                                                     // tile_height = sprite height / 2 (vertical step between rows)
-                                                    mission_iso_config = Some(IsoConfig {
+                                                    let mis_iso = IsoConfig {
+                                                        tile_width: tw,
+                                                        tile_height: th / 2.0,
+                                                        origin_x: 0.0,
+                                                        origin_y: 0.0,
+                                                    };
+                                                    game.mission_iso = Some(IsoConfig {
                                                         tile_width: tw,
                                                         tile_height: th / 2.0,
                                                         origin_x: 0.0,
                                                         origin_y: 0.0,
                                                     });
+                                                    mission_iso_config = Some(mis_iso);
 
                                                     // Center the camera on the middle of the map.
                                                     let mid_x = (map.width() as f32 / 2.0) * (tw / 2.0);
@@ -951,7 +961,10 @@ fn handle_deployment_input(game: &mut GameLoop, event: &Event) {
                 y: *y as f32,
             };
             let world = game.camera.screen_to_world(screen);
-            let tile = game.iso_config.screen_to_tile(world);
+            // Use mission iso config if available (actual tile dimensions),
+            // fall back to default iso config.
+            let iso = game.mission_iso.as_ref().unwrap_or(&game.iso_config);
+            let tile = iso.screen_to_tile(world);
             let core_tile = ow_core::merc::TilePos {
                 x: tile.x,
                 y: tile.y,
@@ -1123,44 +1136,26 @@ fn handle_combat_input(game: &mut GameLoop, event: &Event) {
                     y: *y as f32,
                 };
                 let world = game.camera.screen_to_world(screen);
-                let tile = game.iso_config.screen_to_tile(world);
+                let iso = game.mission_iso.as_ref().unwrap_or(&game.iso_config);
+                let tile = iso.screen_to_tile(world);
                 let target_tile = ow_core::merc::TilePos {
                     x: tile.x,
                     y: tile.y,
                 };
 
-                // Check if an enemy occupies this tile
-                // TODO: Wire through MissionState.enemy_units for real lookup.
-                let enemy_at_tile: Option<MercId> = None;
-
-                if let Some(enemy_id) = enemy_at_tile {
-                    info!(
-                        shooter = unit_id,
-                        target = enemy_id,
-                        "Player shooting at enemy"
-                    );
-                    debug!(
-                        action = ?Action::Shoot(enemy_id),
-                        "Queued shoot action (pending execute_action wiring)"
-                    );
-                } else {
-                    // Move to the tile (placeholder: direct teleport, no AP cost)
-                    info!(
-                        unit_id,
-                        tile_x = target_tile.x,
-                        tile_y = target_tile.y,
-                        "Player moving unit"
-                    );
-                    if let Some(merc) =
-                        game.game_state.team.iter_mut().find(|m| m.id == unit_id)
-                    {
-                        merc.position = Some(target_tile);
-                        debug!(
-                            name = %merc.name,
-                            ?target_tile,
-                            "Unit moved (placeholder -- no AP deduction yet)"
-                        );
-                    }
+                // Move the selected unit to the clicked tile.
+                // For now this is a simple teleport — proper pathfinding
+                // with AP costs comes later.
+                info!(
+                    unit_id,
+                    tile_x = target_tile.x,
+                    tile_y = target_tile.y,
+                    "Player moving unit"
+                );
+                if let Some(merc) =
+                    game.game_state.team.iter_mut().find(|m| m.id == unit_id)
+                {
+                    merc.position = Some(target_tile);
                 }
             }
         }
@@ -1719,19 +1714,81 @@ fn render_mission_map(
         render_placeholder_grid(canvas, &game.camera, &game.iso_config);
     }
 
-    // Draw placed mercs as colored squares on the map.
+    // Draw placed mercs as colored diamonds on the map.
     let iso = mission_iso.as_ref().unwrap_or(&game.iso_config);
-    for (_i, merc) in game.game_state.team.iter().enumerate() {
+
+    // Get selected unit ID if in combat
+    let selected_id = match &game.phase_handler {
+        PhaseHandler::Combat(ch) => ch.selected_unit_id,
+        _ => None,
+    };
+
+    for merc in &game.game_state.team {
+        if !merc.is_alive() { continue; }
         if let Some(pos) = merc.position {
             let iso_tile = TilePos { x: pos.x, y: pos.y };
             let world = iso.tile_to_screen(iso_tile);
             let screen = game.camera.world_to_screen(world);
-            let color = Color::RGB(0, 200, 0);
+
+            let is_selected = selected_id == Some(merc.id);
+            let color = if is_selected {
+                Color::RGB(255, 255, 0) // Yellow = selected unit
+            } else {
+                Color::RGB(0, 220, 0)   // Green = your mercs
+            };
+
+            // Draw a small filled square for each merc
             canvas.set_draw_color(color);
             canvas.fill_rect(Rect::new(
-                screen.x as i32 - 8, screen.y as i32 - 8, 16, 16,
+                screen.x as i32 - 6, screen.y as i32 - 6, 12, 12,
+            )).ok();
+
+            // Draw a dark border for visibility
+            canvas.set_draw_color(Color::RGB(0, 0, 0));
+            canvas.draw_rect(Rect::new(
+                screen.x as i32 - 6, screen.y as i32 - 6, 12, 12,
             )).ok();
         }
+    }
+
+    // -- Simple combat HUD at bottom of screen --
+    if matches!(game.phase_handler, PhaseHandler::Combat(_)) {
+        let (w, h) = (game.window_width, game.window_height);
+
+        // Dark panel at bottom
+        canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+        canvas.set_draw_color(Color::RGBA(0, 0, 0, 200));
+        canvas.fill_rect(Rect::new(0, h as i32 - 60, w, 60)).ok();
+        canvas.set_blend_mode(sdl2::render::BlendMode::None);
+
+        // Show selected unit info
+        if let Some(sel_id) = selected_id {
+            if let Some(merc) = game.game_state.team.iter().find(|m| m.id == sel_id) {
+                let info = format!(
+                    "{} | HP: {}/{} | AP: {}/{} | Tab=Next  Click=Move  E=EndTurn",
+                    merc.name, merc.current_hp, merc.max_hp,
+                    merc.current_ap, merc.base_aps,
+                );
+                _text.draw(canvas, _tc, &info, 15, h as i32 - 40, Color::RGB(220, 220, 220)).ok();
+            }
+        } else {
+            _text.draw(canvas, _tc, "No unit selected | Tab=Next  Enter=NextPhase",
+                15, h as i32 - 40, Color::RGB(180, 180, 180)).ok();
+        }
+    }
+
+    // -- Deployment phase HUD --
+    if matches!(game.phase_handler, PhaseHandler::Deployment { .. }) {
+        let (w, h) = (game.window_width, game.window_height);
+        canvas.set_blend_mode(sdl2::render::BlendMode::Blend);
+        canvas.set_draw_color(Color::RGBA(0, 0, 0, 200));
+        canvas.fill_rect(Rect::new(0, h as i32 - 40, w, 40)).ok();
+        canvas.set_blend_mode(sdl2::render::BlendMode::None);
+
+        let placed = game.game_state.team.iter().filter(|m| m.position.is_some()).count();
+        let total = game.game_state.team.len();
+        let msg = format!("DEPLOYMENT: Click map to place mercs ({placed}/{total} placed) | Enter=Start Combat");
+        _text.draw(canvas, _tc, &msg, 15, h as i32 - 28, Color::RGB(220, 200, 100)).ok();
     }
 
     // -- Minimap: overview in the bottom-right corner --
