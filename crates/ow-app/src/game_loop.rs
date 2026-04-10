@@ -616,6 +616,53 @@ fn handle_office_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset) {
                 return; // Don't fall through to office overview hotspots.
             }
 
+            // --- Contracts: click a mission to accept/switch contracts ---
+            if current_sub == OfficePhase::Contracts {
+                // Contract list starts at y=107 (content_y=50 + header=35 + accepted_line=22).
+                // If no contract is accepted yet, list starts at y=85.
+                let has_accepted = game.game_state.current_mission.is_some();
+                let list_start_y = if has_accepted { 107i32 } else { 85i32 };
+                let row_h = 18i32;
+                let click_y = *y;
+
+                if click_y >= list_start_y {
+                    let row = ((click_y - list_start_y) / row_h) as usize;
+
+                    // Build sorted mission ID list (same order as render).
+                    let mut mission_ids: Vec<_> = ruleset.missions.keys().collect();
+                    mission_ids.sort();
+
+                    if let Some(mid) = mission_ids.get(row) {
+                        if let Some(mission) = ruleset.missions.get(*mid) {
+                            // Accept this contract — credit the advance to funds.
+                            let already_accepted = game.game_state.current_mission
+                                .as_ref()
+                                .map(|m| m.name == **mid)
+                                .unwrap_or(false);
+
+                            if already_accepted {
+                                info!(mission = %mid, "Contract already accepted");
+                            } else {
+                                // If switching contracts, no refund on old advance.
+                                let advance = mission.contract.advance;
+                                game.game_state.funds += advance as i64;
+                                game.game_state.current_mission = Some(
+                                    ow_core::game_state::MissionContext {
+                                        name: mid.to_string(),
+                                        weather: ow_core::weather::Weather::Clear,
+                                        combat: None,
+                                        turn_number: 0,
+                                    }
+                                );
+                                info!(mission = %mid, advance = advance,
+                                      funds = game.game_state.funds, "Contract accepted!");
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
             // Check each clickable hotspot (640x480 coords from the original game).
             // Hotspots are checked in priority order — more specific areas first
             // to prevent overlap issues (e.g., phone vs world map).
@@ -656,15 +703,20 @@ fn handle_office_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset) {
                 // Magazines on desk (lower left) → Equipment
                 Some(("Equipment (Magazines)", OfficePhase::Equipment))
             } else if check_hit(*x, *y, 240, 40, 370, 250, ww, wh) {
-                // Door → Begin Mission
+                // Door → Begin Mission (requires hired mercs AND accepted contract)
                 if game.game_state.team.is_empty() {
                     warn!("Cannot begin mission: no mercs hired");
                     None
+                } else if game.game_state.current_mission.is_none() {
+                    warn!("Cannot begin mission: no contract accepted (click fax first)");
+                    None
                 } else {
-                    info!(team_size = game.game_state.team.len(), "Beginning mission");
+                    info!(team_size = game.game_state.team.len(),
+                          mission = %game.game_state.current_mission.as_ref().unwrap().name,
+                          "Beginning mission");
                     game.game_state.set_phase(GamePhase::Travel);
                     game.phase_handler = PhaseHandler::Travel { elapsed_ms: 0 };
-                    None // Already transitioned, don't set office sub-phase.
+                    None
                 }
             } else {
                 None
@@ -703,8 +755,13 @@ fn handle_office_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset) {
                     if game.game_state.team.is_empty() {
                         warn!("Cannot begin mission: no mercs hired");
                         None
+                    } else if game.game_state.current_mission.is_none() {
+                        warn!("Cannot begin mission: no contract accepted");
+                        None
                     } else {
-                        info!(team_size = game.game_state.team.len(), "Beginning mission");
+                        info!(team_size = game.game_state.team.len(),
+                              mission = %game.game_state.current_mission.as_ref().unwrap().name,
+                              "Beginning mission");
                         game.game_state.set_phase(GamePhase::Travel);
                         game.phase_handler = PhaseHandler::Travel { elapsed_ms: 0 };
                         None
@@ -1426,21 +1483,40 @@ fn render_office(
             }
         }
         OfficePhase::Contracts => {
-            text.draw_header(canvas, tc, "Available Contracts", 20, content_y, Color::RGB(220, 200, 100)).ok();
+            text.draw_header(canvas, tc, "Available Contracts — Click to Accept", 20, content_y, Color::RGB(220, 200, 100)).ok();
             let mut y = content_y + 35;
 
-            // Show mission contracts from the ruleset
+            // Show which contract is currently accepted, if any.
+            let accepted_id = game.game_state.current_mission.as_ref().map(|m| m.name.clone());
+            if let Some(ref aid) = accepted_id {
+                text.draw(canvas, tc, &format!("ACCEPTED: {} — Press B or click door to deploy!", aid),
+                    20, y, Color::RGB(100, 255, 100)).ok();
+                y += 22;
+            }
+
+            // Show mission contracts from the ruleset.
+            // Accepted contract shown in green, others in white.
             let mut mission_ids: Vec<_> = ruleset.missions.keys().collect();
             mission_ids.sort();
             for mid in &mission_ids {
                 if let Some(mission) = ruleset.missions.get(*mid) {
+                    let is_accepted = accepted_id.as_deref() == Some(mid.as_str());
+                    let color = if is_accepted {
+                        Color::RGB(100, 255, 100) // green = accepted
+                    } else {
+                        Color::RGB(200, 200, 200) // white = available
+                    };
+                    let tag = if is_accepted { " [ACCEPTED]" } else { "" };
+                    let terms = if mission.contract.terms.len() > 60 {
+                        &mission.contract.terms[..60]
+                    } else {
+                        &mission.contract.terms
+                    };
                     let line = format!(
-                        "{}: {} — Advance: ${}, Bonus: ${}",
-                        mid, mission.contract.terms, mission.contract.advance, mission.contract.bonus
+                        "{}: {}... Adv:${} Bon:${}{}",
+                        mid, terms, mission.contract.advance, mission.contract.bonus, tag
                     );
-                    // Truncate long lines
-                    let display = if line.len() > 120 { &line[..120] } else { &line };
-                    text.draw_small(canvas, tc, display, 20, y, Color::RGB(200, 200, 200)).ok();
+                    text.draw_small(canvas, tc, &line, 20, y, color).ok();
                     y += 18;
                     if y > (content_y + content_h - 20) { break; }
                 }
