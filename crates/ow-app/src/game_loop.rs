@@ -422,13 +422,24 @@ pub fn run_game_loop(
                                                     info!(tile_w = tw, tile_h = th,
                                                           tiles = tr.tile_count(), "Tiles ready");
 
-                                                    // Configure iso projection for these tile dimensions.
+                                                    // Configure iso projection for the map.
+                                                    // The tile sprites are 128x63 pixels, but the isometric
+                                                    // grid step is half the sprite height — tiles overlap
+                                                    // vertically to create the seamless diamond pattern.
+                                                    // tile_width = sprite width (horizontal step between columns)
+                                                    // tile_height = sprite height / 2 (vertical step between rows)
                                                     mission_iso_config = Some(IsoConfig {
                                                         tile_width: tw,
                                                         tile_height: th / 2.0,
-                                                        origin_x: (game.window_width as f32) / 2.0,
-                                                        origin_y: 50.0,
+                                                        origin_x: 0.0,
+                                                        origin_y: 0.0,
                                                     });
+
+                                                    // Center the camera on the middle of the map.
+                                                    let mid_x = (map.width() as f32 / 2.0) * (tw / 2.0);
+                                                    let mid_y = (map.active_rows() as f32 / 2.0) * (th / 2.0);
+                                                    game.camera.x = mid_x - (game.window_width as f32 / 2.0);
+                                                    game.camera.y = mid_y - (game.window_height as f32 / 2.0);
                                                     tile_renderer = Some(tr);
                                                 }
                                                 break;
@@ -880,6 +891,36 @@ fn handle_office_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset) {
 /// - WASD: scroll camera.
 fn handle_deployment_input(game: &mut GameLoop, event: &Event) {
     match event {
+        // WASD / Arrow keys: scroll the camera around the map.
+        Event::KeyDown { keycode: Some(key), .. } if matches!(*key,
+            Keycode::W | Keycode::A | Keycode::S | Keycode::D |
+            Keycode::Up | Keycode::Down | Keycode::Left | Keycode::Right
+        ) => {
+            let speed = 32.0;
+            match *key {
+                Keycode::W | Keycode::Up => game.camera.scroll(0.0, -speed),
+                Keycode::S | Keycode::Down => game.camera.scroll(0.0, speed),
+                Keycode::A | Keycode::Left => game.camera.scroll(-speed, 0.0),
+                Keycode::D | Keycode::Right => game.camera.scroll(speed, 0.0),
+                _ => {}
+            }
+        }
+
+        // +/- zoom
+        Event::KeyDown { keycode: Some(Keycode::Equals), .. } |
+        Event::KeyDown { keycode: Some(Keycode::Plus), .. } => {
+            game.camera.zoom_in();
+        }
+        Event::KeyDown { keycode: Some(Keycode::Minus), .. } => {
+            game.camera.zoom_out();
+        }
+
+        // Mouse wheel zoom
+        Event::MouseWheel { y, .. } => {
+            if *y > 0 { game.camera.zoom_in(); }
+            else if *y < 0 { game.camera.zoom_out(); }
+        }
+
         // Tab: cycle to next merc for placement
         Event::KeyDown {
             keycode: Some(Keycode::Tab),
