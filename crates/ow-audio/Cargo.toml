@@ -9,3 +9,6 @@ license.workspace = true
 sdl2 = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+byteorder = { workspace = true }

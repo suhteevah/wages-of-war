@@ -15,3 +15,7 @@ pub mod palette;
 pub mod sprite_renderer;
 pub mod tile_renderer;
 pub mod viewer;
+pub mod anim_controller;
+pub mod unit_renderer;
+pub mod hud;
+pub mod ui;

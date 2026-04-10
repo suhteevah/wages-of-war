@@ -41,3 +41,4 @@ pub mod textrect;
 pub mod sprite;
 pub mod palette;
 pub mod map_loader;
+pub mod wri;

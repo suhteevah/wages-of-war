@@ -20,6 +20,6 @@ pub mod contract;
 pub mod mission_setup;
 pub mod actions;
 pub mod ai;
-
-// TODO: Future modules
-// pub mod map;
+pub mod save;
+pub mod config;
+pub mod ruleset;

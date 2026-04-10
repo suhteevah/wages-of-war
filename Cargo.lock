@@ -361,7 +361,10 @@ name = "ow-audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "byteorder",
  "sdl2",
+ "serde",
+ "thiserror",
  "tracing",
 ]
 
@@ -411,6 +414,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ow-data",
  "serde",
  "serde_json",
  "tracing",

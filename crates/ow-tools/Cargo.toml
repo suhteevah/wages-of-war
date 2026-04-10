@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 walkdir = { workspace = true }
+ow-data = { path = "../ow-data" }
 
 [[bin]]
 name = "survey"
@@ -21,3 +22,7 @@ path = "src/bin/survey.rs"
 [[bin]]
 name = "triage"
 path = "src/bin/triage.rs"
+
+[[bin]]
+name = "validate-all"
+path = "src/bin/validate_all.rs"
