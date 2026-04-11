@@ -90,7 +90,6 @@ fn main() -> anyhow::Result<()> {
         map = %map_path.display(),
         width = map.width(),
         height = map.height(),
-        active_rows = map.active_rows(),
         tileset_ref = %map.asset_refs.tileset_path,
         "map loaded"
     );

@@ -3,6 +3,21 @@
 ## Identity
 **Open Wages** is a clean-room, open-source Rust reimplementation of the engine for *Wages of War: The Business of Battle* (1996, Random Games / New World Computing / 3DO). All three companies are defunct. This follows the **OpenXCOM model**: we build a modern engine that reads the original game's data files. No copyrighted code or assets are redistributed.
 
+## Handoff Protocol
+- ALWAYS read `handoff.md` and recent memory files BEFORE diagnosing any issue
+- Trust prior session findings — do not re-diagnose bugs already patched
+- Update `handoff.md` at end of session with current state, blockers, and next steps
+
+## Diagnosis Discipline
+- Investigate the actual error before suggesting generic fixes
+- Do not assume a dependency is missing until verified with `where`/`which`
+- Read error output carefully — the answer is usually in the stack trace
+
+## Output Discipline
+- Keep responses concise; avoid long explanations after task completion
+- Write detailed analysis/output to files instead of dumping into chat
+- When hitting context limits, summarize and offer to continue
+
 ## Project Principles
 1. **Rust-only house.** All code is Rust — engine, tooling, everything. No Python.
 2. **Verbose logging everywhere.** Every crate uses `tracing` with `RUST_LOG` env filtering. No silent failures. Log file reads, parse results, state transitions, combat rolls — everything.
@@ -42,7 +57,7 @@ open-wages/
 - **Suppression system**: Incoming fire can suppress units even on a miss, reducing AP and initiative.
 - **Weather effects**: Rain, fog, night, sandstorm — affect accuracy, sight range, smoke grenades.
 - **Economy layer**: Hire mercs, buy equipment, accept contracts, manage profit/reputation.
-- **Isometric rendering**: Diamond projection, 2:1 tile ratio (64×32 typical), painter's algorithm draw order.
+- **Isometric rendering**: Staggered grid (NOT standard diamond). 128x64px tiles, odd rows offset +64px. Confirmed by Wow.exe RE.
 
 ## Data Files
 The original game's `.dat` files are **plaintext** (confirmed text-editable with Notepad++). This is a massive simplification — the data layer is INI/CSV-style, not packed binary. Sprite/map data may still be binary.

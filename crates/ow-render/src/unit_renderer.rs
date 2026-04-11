@@ -486,52 +486,51 @@ mod tests {
 
     #[test]
     fn unit_screen_position_matches_tile_center() {
+        // Staggered grid: sx = origin_x + col * tile_width (+ half_w if odd row)
+        //                 sy = origin_y + row * (tile_height / 2)
         let iso = IsoConfig {
-            tile_width: 64.0,
-            tile_height: 32.0,
+            tile_width: 128.0,
+            tile_height: 64.0,
             origin_x: 400.0,
             origin_y: 100.0,
         };
         let camera = Camera::new(1280, 720);
 
-        let tile = TilePos { x: 3, y: 5 };
+        let tile = TilePos { x: 3, y: 4 }; // even row
         let world = iso.tile_to_screen(tile);
         let screen = camera.world_to_screen(world);
 
-        // Expected world position:
-        //   sx = 400 + (3 - 5) * 32 = 400 - 64 = 336
-        //   sy = 100 + (3 + 5) * 16 = 100 + 128 = 228
-        // Camera at (0,0) zoom 1.0 → screen == world.
-        assert!((screen.x - 336.0).abs() < 0.01);
+        // sx = 400 + 3*128 = 784, sy = 100 + 4*32 = 228
+        assert!((screen.x - 784.0).abs() < 0.01);
         assert!((screen.y - 228.0).abs() < 0.01);
     }
 
     #[test]
     fn unit_screen_position_with_camera_offset() {
         let iso = IsoConfig {
-            tile_width: 64.0,
-            tile_height: 32.0,
+            tile_width: 128.0,
+            tile_height: 64.0,
             origin_x: 0.0,
             origin_y: 0.0,
         };
         let mut camera = Camera::new(1280, 720);
         camera.scroll(100.0, 50.0);
 
-        let tile = TilePos { x: 2, y: 2 };
+        let tile = TilePos { x: 2, y: 2 }; // even row
         let world = iso.tile_to_screen(tile);
         let screen = camera.world_to_screen(world);
 
-        // World: sx = (2-2)*32 = 0, sy = (2+2)*16 = 64
-        // Camera offset (100, 50), zoom 1.0: screen = (0-100, 64-50) = (-100, 14)
-        assert!((screen.x - (-100.0)).abs() < 0.01);
+        // World: sx = 2*128 = 256, sy = 2*32 = 64
+        // Camera offset (100, 50), zoom 1.0: screen = (256-100, 64-50) = (156, 14)
+        assert!((screen.x - 156.0).abs() < 0.01);
         assert!((screen.y - 14.0).abs() < 0.01);
     }
 
     #[test]
     fn unit_screen_position_with_zoom() {
         let iso = IsoConfig {
-            tile_width: 64.0,
-            tile_height: 32.0,
+            tile_width: 128.0,
+            tile_height: 64.0,
             origin_x: 0.0,
             origin_y: 0.0,
         };
@@ -547,10 +546,10 @@ mod tests {
         let world = iso.tile_to_screen(tile);
         let screen = camera.world_to_screen(world);
 
-        // World: sx = (1-0)*32 = 32, sy = (1+0)*16 = 16
-        // Zoom 2.0: screen = (32*2, 16*2) = (64, 32)
-        assert!((screen.x - 64.0).abs() < 0.01);
-        assert!((screen.y - 32.0).abs() < 0.01);
+        // World: sx = 1*128 = 128, sy = 0*32 = 0
+        // Zoom 2.0: screen = (128*2, 0*2) = (256, 0)
+        assert!((screen.x - 256.0).abs() < 0.01);
+        assert!((screen.y - 0.0).abs() < 0.01);
     }
 
     // -- Helper --

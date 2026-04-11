@@ -42,6 +42,8 @@ use sdl2::video::{Window, WindowContext};
 use sdl2::Sdl;
 use tracing::{debug, info, trace, warn};
 
+use ow_audio::sfx::{CombatSound, SfxManager};
+use ow_audio::voice::VoicePlayer;
 use ow_core::actions::Action;
 use ow_core::game_state::{GamePhase, GameState, MissionPhase, OfficePhase};
 use ow_core::merc::MercId;
@@ -98,9 +100,13 @@ pub enum PhaseHandler {
     Extraction,
 
     /// Post-mission debrief showing results.
+    /// The accountant calls on the video phone to deliver the financial report.
     Debrief {
         /// True if the mission was a success.
         success: bool,
+        /// Accumulated time in this phase (ms). Drives the accountant sprite
+        /// animation cycling on the video phone.
+        anim_elapsed_ms: u32,
     },
 
     /// Pause overlay — remembers the phase we paused from.
@@ -242,7 +248,7 @@ fn phase_handler_for(phase: &GamePhase) -> PhaseHandler {
             tab_cycle_index: 0,
         }),
         GamePhase::Mission(MissionPhase::Extraction) => PhaseHandler::Extraction,
-        GamePhase::Debrief => PhaseHandler::Debrief { success: true },
+        GamePhase::Debrief => PhaseHandler::Debrief { success: true, anim_elapsed_ms: 0 },
     }
 }
 
@@ -267,8 +273,8 @@ fn music_track_for_phase(handler: &PhaseHandler) -> Option<&'static str> {
         PhaseHandler::Deployment { .. } => Some("WOWMIS01"),
         PhaseHandler::Combat(_) => Some("WOWMIS01"),
         PhaseHandler::Extraction => Some("WOWMIS01"),
-        PhaseHandler::Debrief { success: true } => Some("WOWDPARW"),
-        PhaseHandler::Debrief { success: false } => Some("WOWDPARL"),
+        PhaseHandler::Debrief { success: true, .. } => Some("WOWDPARW"),
+        PhaseHandler::Debrief { success: false, .. } => Some("WOWDPARL"),
         PhaseHandler::Paused { .. } => None, // keep whatever was playing
     }
 }
@@ -348,7 +354,7 @@ fn phase_background_color(handler: &PhaseHandler) -> Color {
         PhaseHandler::Deployment { .. } => Color::RGB(30, 50, 30),
         PhaseHandler::Combat(_) => Color::RGB(10, 10, 10),
         PhaseHandler::Extraction => Color::RGB(40, 50, 30),
-        PhaseHandler::Debrief { success } => {
+        PhaseHandler::Debrief { success, .. } => {
             if *success {
                 Color::RGB(20, 50, 20)
             } else {
@@ -374,7 +380,7 @@ fn phase_label(handler: &PhaseHandler) -> &'static str {
         PhaseHandler::Deployment { .. } => "MISSION - Deployment",
         PhaseHandler::Combat(_) => "MISSION - Combat",
         PhaseHandler::Extraction => "MISSION - Extraction",
-        PhaseHandler::Debrief { success } => {
+        PhaseHandler::Debrief { success, .. } => {
             if *success {
                 "DEBRIEF - Mission Complete!"
             } else {
@@ -403,7 +409,23 @@ fn phase_label(handler: &PhaseHandler) -> &'static str {
 /// `Ok(())` on clean exit, `Err` on SDL2 or fatal engine errors.
 pub fn run_game_loop(
     sdl_context: &Sdl,
+    canvas: Canvas<Window>,
+    game_state: GameState,
+    ruleset: Ruleset,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    let event_pump = sdl_context
+        .event_pump()
+        .map_err(|e| anyhow::anyhow!("Failed to get SDL2 event pump: {e}"))?;
+    run_game_loop_with_pump(sdl_context, canvas, event_pump, game_state, ruleset, data_dir)
+}
+
+/// Game loop variant that accepts an existing event pump (used when
+/// the intro cutscenes already created one before handing off).
+pub fn run_game_loop_with_pump(
+    sdl_context: &Sdl,
     mut canvas: Canvas<Window>,
+    mut event_pump: sdl2::EventPump,
     game_state: GameState,
     ruleset: Ruleset,
     data_dir: &std::path::Path,
@@ -411,9 +433,6 @@ pub fn run_game_loop(
     info!(phase = ?game_state.phase, "Starting game loop");
 
     let mut game = GameLoop::new(game_state);
-    let mut event_pump = sdl_context
-        .event_pump()
-        .map_err(|e| anyhow::anyhow!("Failed to get SDL2 event pump: {e}"))?;
 
     // Initialize text rendering — loads a system font for UI text.
     let ttf_context =
@@ -454,6 +473,26 @@ pub fn run_game_loop(
         None
     };
 
+    // -----------------------------------------------------------------------
+    // Combat SFX — pre-load WAV files from WOW/SND/ as mixer Chunks.
+    // Channels 2–7 are reserved for SFX; 0–1 stay free for voice/music.
+    // -----------------------------------------------------------------------
+    let snd_dir = data_dir.join("WOW").join("SND");
+    let mut sfx_manager = SfxManager::new(&snd_dir, audio_available);
+
+    // -----------------------------------------------------------------------
+    // Voice line playback — on-demand WAV loading from WOW/WAV/.
+    // Uses mixer channel 1 (separate from music and SFX channels 2-7).
+    // Voice lines play when hiring a merc or selecting one in combat.
+    // -----------------------------------------------------------------------
+    let wav_dir = data_dir.join("WOW").join("WAV");
+    let mut voice_player: Option<VoicePlayer> = if audio_available {
+        Some(VoicePlayer::new(wav_dir))
+    } else {
+        debug!("Voice player disabled (no audio device)");
+        None
+    };
+
     // Load the office background image — OFFICE.PCX is the main HQ screen.
     // The original game renders this as a 640x480 scene with clickable objects
     // (phone, fax, filing cabinet, pizza, etc.) overlaid on the background.
@@ -485,6 +524,127 @@ pub fn run_game_loop(
         }
     };
 
+    // -----------------------------------------------------------------------
+    // Debrief screen sprites -- accountant + video phone
+    // -----------------------------------------------------------------------
+    // ACCT.OBJ contains the accountant character sprites (animated on the
+    // video phone during the post-mission financial debrief). PHONSPR.OBJ
+    // contains the phone scene background frames. Both use the same FLC
+    // sprite container format as tilesets and OBJ files.
+    //
+    // We load all frames at startup and convert them to SDL2 textures so
+    // the debrief renderer can just index into them by frame number.
+    let (acct_textures, phone_textures) = {
+        // Use OFFPIC2.PCX palette -- it is the closest match to the game's
+        // master VGA palette and we already loaded it for the office scene.
+        let pic_dir = data_dir.join("WOW").join("PIC");
+        let palette = {
+            let offpic = pic_dir.join("OFFPIC2.PCX");
+            match ow_render::palette::load_pcx_palette(&offpic) {
+                Ok(pal) => Some(pal),
+                Err(e) => {
+                    warn!("Failed to load palette for debrief sprites: {e}");
+                    None
+                }
+            }
+        };
+
+        let spr_dir = data_dir.join("WOW").join("SPR");
+
+        /// Decode all frames from a sprite sheet into RGBA SDL2 textures.
+        /// Returns an empty vec if loading fails -- the renderer will fall
+        /// back to the placeholder debrief display.
+        fn load_sprite_textures<'a>(
+            path: &Path,
+            palette: &Option<ow_render::palette::Palette256>,
+            tc: &'a TextureCreator<WindowContext>,
+        ) -> Vec<Texture<'a>> {
+            let pal = match palette {
+                Some(p) => p,
+                None => {
+                    warn!(path = %path.display(),
+                          "no palette available -- skipping sprite load");
+                    return Vec::new();
+                }
+            };
+
+            let sheet = match ow_data::sprite::parse_sprite_file(path) {
+                Ok(s) => {
+                    info!(
+                        path = %path.display(),
+                        frames = s.file_header.sprite_count,
+                        "debrief sprite sheet loaded"
+                    );
+                    s
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e,
+                          "failed to parse debrief sprite sheet");
+                    return Vec::new();
+                }
+            };
+
+            let mut textures = Vec::with_capacity(sheet.frames.len());
+            for (i, frame) in sheet.frames.iter().enumerate() {
+                let fw = frame.header.width as u32;
+                let fh = frame.header.height as u32;
+                if fw == 0 || fh == 0 {
+                    // Some sprite sheets have empty placeholder frames.
+                    trace!(frame = i, "skipping zero-size sprite frame");
+                    continue;
+                }
+                match ow_data::sprite::decode_rle(
+                    &frame.compressed_data,
+                    frame.header.width,
+                    frame.header.height,
+                    i,
+                ) {
+                    Ok(pixels) => {
+                        // Brightness boost of 1.5 to compensate for CRT->LCD gamma.
+                        let rgba =
+                            ow_render::palette::apply_palette_with_brightness(&pixels, pal, 1.5);
+                        match tc.create_texture_static(
+                            sdl2::pixels::PixelFormatEnum::RGBA32,
+                            fw,
+                            fh,
+                        ) {
+                            Ok(mut tex) => {
+                                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                                if let Err(e) = tex.update(None, &rgba, (fw * 4) as usize) {
+                                    warn!(frame = i, error = %e,
+                                          "failed to upload sprite texture");
+                                } else {
+                                    textures.push(tex);
+                                }
+                            }
+                            Err(e) => {
+                                warn!(frame = i, error = %e,
+                                      "failed to create sprite texture");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(frame = i, error = %e, "RLE decode failed for sprite frame");
+                    }
+                }
+            }
+            info!(
+                path = %path.display(),
+                decoded = textures.len(),
+                total = sheet.frames.len(),
+                "debrief sprite textures ready"
+            );
+            textures
+        }
+
+        let acct_path = spr_dir.join("ACCT.OBJ");
+        let phone_path = spr_dir.join("PHONSPR.OBJ");
+
+        let acct = load_sprite_textures(&acct_path, &palette, &texture_creator);
+        let phone = load_sprite_textures(&phone_path, &palette, &texture_creator);
+        (acct, phone)
+    };
+
     // -- Mission map resources (loaded when entering deployment) --
     // These are Option because they don't exist until a mission starts.
     let mut tile_renderer: Option<ow_render::tile_renderer::TileMapRenderer> = None;
@@ -492,8 +652,14 @@ pub fn run_game_loop(
     let mut loaded_map: Option<ow_data::map_loader::GameMap> = None;
     let mut mission_iso_config: Option<IsoConfig> = None;
 
-    // Soldier sprite texture decoded from ANIM/JUNGSLD.DAT frame 1000
-    // (south-facing idle pose). Used to render player mercs on the mission map.
+    // Soldier animation system: all frames from ANIM/JUNGSLD.DAT decoded into
+    // textures, indexed by the AnimController's current_frame_index().
+    // The COR file maps (action, direction, weapon) → frame ranges.
+    let mut soldier_textures: Vec<Option<Texture>> = Vec::new();
+    let mut soldier_anim_set: Option<ow_data::animation::AnimationSet> = None;
+    // Per-merc animation controllers, keyed by merc index in the team.
+    let mut soldier_anims: Vec<ow_render::anim_controller::AnimController> = Vec::new();
+    // Backwards compat — kept as fallback if full animation loading fails.
     let mut soldier_texture: Option<Texture> = None;
 
     // Enemy units generated from mission data. Stored here so they persist
@@ -548,9 +714,74 @@ pub fn run_game_loop(
                     save_screenshot(&canvas);
                 }
 
+                // ======= DEV HOTKEYS =======
+                // F1: Skip to debrief (win current mission instantly)
+                Event::KeyDown {
+                    keycode: Some(Keycode::F1),
+                    ..
+                } => {
+                    info!("[DEV] F1: Force win → Debrief");
+                    game.game_state.set_phase(GamePhase::Debrief);
+                    game.phase_handler = PhaseHandler::Debrief { success: true, anim_elapsed_ms: 0 };
+                }
+
+                // F2: Skip to office (abort mission, go home)
+                Event::KeyDown {
+                    keycode: Some(Keycode::F2),
+                    ..
+                } => {
+                    info!("[DEV] F2: Force → Office");
+                    game.game_state.set_phase(GamePhase::Office(ow_core::game_state::OfficePhase::Overview));
+                    game.phase_handler = PhaseHandler::Office {
+                        sub_phase: ow_core::game_state::OfficePhase::Overview,
+                    };
+                }
+
+                // F3: Skip to deployment (start mission 1 with current team)
+                Event::KeyDown {
+                    keycode: Some(Keycode::F3),
+                    ..
+                } => {
+                    if game.game_state.team.is_empty() {
+                        info!("[DEV] F3: Can't deploy — no mercs hired");
+                    } else {
+                        info!("[DEV] F3: Force → Deployment (mission 1)");
+                        if game.game_state.current_mission.is_none() {
+                            game.game_state.current_mission = Some(ow_core::game_state::MissionContext {
+                                name: "MSSN01".to_string(),
+                                weather: ow_core::weather::Weather::Clear,
+                                combat: None,
+                                turn_number: 0,
+                            });
+                        }
+                        game.game_state.set_phase(GamePhase::Mission(ow_core::game_state::MissionPhase::Deployment));
+                        game.phase_handler = PhaseHandler::Deployment {
+                            selected_unit: 0,
+                        };
+                    }
+                }
+
+                // F4: Kill all enemies (instant win condition)
+                Event::KeyDown {
+                    keycode: Some(Keycode::F4),
+                    ..
+                } => {
+                    info!("[DEV] F4: Kill all enemies");
+                    game.enemies.clear();
+                }
+
+                // F5: Add $500k funds
+                Event::KeyDown {
+                    keycode: Some(Keycode::F5),
+                    ..
+                } => {
+                    game.game_state.funds += 500_000;
+                    info!("[DEV] F5: +$500k → funds={}", game.game_state.funds);
+                }
+
                 // Delegate all other input to the current phase handler
                 _ => {
-                    handle_phase_input(&mut game, &event, &ruleset);
+                    handle_phase_input(&mut game, &event, &ruleset, &mut sfx_manager, &mut voice_player);
                 }
             }
         }
@@ -560,7 +791,12 @@ pub fn run_game_loop(
         }
 
         // -- Update --
-        update_phase(&mut game, delta_ms);
+        update_phase(&mut game, delta_ms, &mut sfx_manager);
+
+        // Tick soldier animation controllers so idle/walk/shoot frames advance.
+        for ctrl in soldier_anims.iter_mut() {
+            ctrl.update(delta_ms as f32);
+        }
 
         // -- Music transitions on phase change --
         // Compare what we're currently playing to what the new phase wants.
@@ -689,30 +925,44 @@ pub fn run_game_loop(
                                                 "Tiles ready"
                                             );
 
-                                            // Configure iso projection for the map.
-                                            // The tile sprites are 128x63 pixels, but the isometric
-                                            // grid step is half the sprite height — tiles overlap
-                                            // vertically to create the seamless diamond pattern.
-                                            // tile_width = sprite width (horizontal step between columns)
-                                            // tile_height = sprite height / 2 (vertical step between rows)
+                                            // Configure iso projection for the staggered grid.
+                                            // Wages of War uses a staggered grid, NOT standard
+                                            // diamond iso. Tile dimensions are 128x64 from the exe.
+                                            // tile_width = 128 (full tile width, horizontal step)
+                                            // tile_height = 64 (full tile height, vertical step)
+                                            // Odd rows are offset +64px by tile_to_screen().
                                             let mis_iso = IsoConfig {
-                                                tile_width: tw,
-                                                tile_height: th / 2.0,
+                                                tile_width: 128.0,
+                                                tile_height: 64.0,
                                                 origin_x: 0.0,
                                                 origin_y: 0.0,
                                             };
                                             game.mission_iso = Some(IsoConfig {
-                                                tile_width: tw,
-                                                tile_height: th / 2.0,
+                                                tile_width: 128.0,
+                                                tile_height: 64.0,
                                                 origin_x: 0.0,
                                                 origin_y: 0.0,
                                             });
                                             mission_iso_config = Some(mis_iso);
 
-                                            // Center the camera on the middle of the map.
-                                            let mid_x = (map.width() as f32 / 2.0) * (tw / 2.0);
-                                            let mid_y =
-                                                (map.active_rows() as f32 / 2.0) * (th / 2.0);
+                                            // Center the camera on the middle of the 140x72
+                                            // staggered grid. Use the initial camera position
+                                            // from the MAP file if available, otherwise center
+                                            // on the map midpoint.
+                                            // Camera position: use MAP's stored position if
+                                            // available, otherwise center on the map.
+                                            // Row spacing is half tile height (32px) for
+                                            // interlocking diamonds.
+                                            let mid_x = if map.header.camera_x != 0 {
+                                                map.header.camera_x as f32
+                                            } else {
+                                                (map.width() as f32 / 2.0) * 128.0
+                                            };
+                                            let mid_y = if map.header.camera_y != 0 {
+                                                map.header.camera_y as f32
+                                            } else {
+                                                (map.height() as f32 / 2.0) * 32.0
+                                            };
                                             game.camera.x =
                                                 mid_x - (game.window_width as f32 / 2.0);
                                             game.camera.y =
@@ -762,63 +1012,62 @@ pub fn run_game_loop(
                                                 warn!(path = %obj_path.display(), "OBJ sprite file not found");
                                             }
 
-                                            // Load soldier sprite from ANIM/JUNGSLD.DAT
-                                            // Frame 1000 is a south-facing idle pose.
+                                            // Load soldier animation: COR index + DAT sprite frames.
                                             let anim_dir = data_dir.join("WOW").join("ANIM");
+                                            let cor_path = anim_dir.join("JUNGSLD.COR");
                                             let sld_path = anim_dir.join("JUNGSLD.DAT");
+
+                                            if cor_path.exists() {
+                                                match ow_data::animation::parse_animation(&cor_path) {
+                                                    Ok(anim_set) => {
+                                                        info!(entries = anim_set.entries.len(), "COR animation index loaded");
+                                                        soldier_anim_set = Some(anim_set);
+                                                    }
+                                                    Err(e) => warn!("Failed to parse JUNGSLD.COR: {e}"),
+                                                }
+                                            }
+
                                             if sld_path.exists() {
                                                 match ow_data::sprite::parse_sprite_file(&sld_path) {
                                                     Ok(sld_sheet) => {
-                                                        info!(
-                                                            frames = sld_sheet.file_header.sprite_count,
-                                                            "JUNGSLD.DAT soldier sprite sheet loaded"
-                                                        );
-                                                        let frame_idx: usize = 1000;
-                                                        if frame_idx < sld_sheet.frames.len() {
-                                                            let frame = &sld_sheet.frames[frame_idx];
+                                                        let total = sld_sheet.frames.len();
+                                                        let max_frames = total.min(2000);
+                                                        info!(total, loading = max_frames, "Decoding soldier frames");
+                                                        soldier_textures.clear();
+                                                        let mut decoded = 0u32;
+                                                        for i in 0..max_frames {
+                                                            let frame = &sld_sheet.frames[i];
                                                             let fw = frame.header.width as u32;
                                                             let fh = frame.header.height as u32;
-                                                            info!(
-                                                                frame = frame_idx,
-                                                                width = fw,
-                                                                height = fh,
-                                                                origin_x = frame.header.origin_x,
-                                                                origin_y = frame.header.origin_y,
-                                                                "decoding soldier idle frame"
-                                                            );
-                                                            match ow_data::sprite::decode_rle(
-                                                                &frame.compressed_data,
-                                                                frame.header.width,
-                                                                frame.header.height,
-                                                                frame_idx,
-                                                            ) {
-                                                                Ok(pixels) => {
-                                                                    let rgba = ow_render::palette::apply_palette_with_brightness(&pixels, &pal, 1.5);
-                                                                    match texture_creator.create_texture_static(
-                                                                        sdl2::pixels::PixelFormatEnum::RGBA32,
-                                                                        fw,
-                                                                        fh,
-                                                                    ) {
-                                                                        Ok(mut tex) => {
-                                                                            tex.set_blend_mode(sdl2::render::BlendMode::Blend);
-                                                                            if let Err(e) = tex.update(None, &rgba, (fw * 4) as usize) {
-                                                                                warn!("Failed to upload soldier texture: {e}");
-                                                                            } else {
-                                                                                info!("Soldier sprite texture ready (frame {frame_idx})");
-                                                                                soldier_texture = Some(tex);
-                                                                            }
-                                                                        }
-                                                                        Err(e) => warn!("Failed to create soldier texture: {e}"),
-                                                                    }
-                                                                }
-                                                                Err(e) => warn!("RLE decode failed for soldier frame {frame_idx}: {e}"),
+                                                            if fw == 0 || fh == 0 { soldier_textures.push(None); continue; }
+                                                            let tex_opt = ow_data::sprite::decode_rle(
+                                                                &frame.compressed_data, frame.header.width, frame.header.height, i,
+                                                            ).ok().and_then(|pixels| {
+                                                                let rgba = ow_render::palette::apply_palette_with_brightness(&pixels, &pal, 1.5);
+                                                                let mut tex = texture_creator.create_texture_static(
+                                                                    sdl2::pixels::PixelFormatEnum::RGBA32, fw, fh,
+                                                                ).ok()?;
+                                                                tex.set_blend_mode(sdl2::render::BlendMode::Blend);
+                                                                tex.update(None, &rgba, (fw * 4) as usize).ok()?;
+                                                                decoded += 1;
+                                                                Some(tex)
+                                                            });
+                                                            soldier_textures.push(tex_opt);
+                                                        }
+                                                        info!(decoded, "Soldier animation frames ready");
+
+                                                        // Create per-merc AnimControllers in idle pose.
+                                                        if let Some(ref anim_set) = soldier_anim_set {
+                                                            soldier_anims.clear();
+                                                            for _merc in &game.game_state.team {
+                                                                let mut ctrl = ow_render::anim_controller::AnimController::new(anim_set.clone());
+                                                                ctrl.set_action(
+                                                                    ow_render::anim_controller::AnimAction::Idle,
+                                                                    ow_render::anim_controller::Direction::S, 1,
+                                                                );
+                                                                soldier_anims.push(ctrl);
                                                             }
-                                                        } else {
-                                                            warn!(
-                                                                frame_idx,
-                                                                total = sld_sheet.frames.len(),
-                                                                "soldier frame index out of range"
-                                                            );
+                                                            info!(controllers = soldier_anims.len(), "AnimControllers ready");
                                                         }
                                                     }
                                                     Err(e) => warn!("Failed to load JUNGSLD.DAT: {e}"),
@@ -905,6 +1154,10 @@ pub fn run_game_loop(
             &loaded_map,
             &mission_iso_config,
             &soldier_texture,
+            &acct_textures,
+            &phone_textures,
+            &soldier_textures,
+            &soldier_anims,
         );
 
         // Title bar shows the current phase (placeholder for real UI)
@@ -928,6 +1181,9 @@ pub fn run_game_loop(
 
     // Clean up music before exit.
     drop(_music_handle);
+    // Drop voice player before closing audio device — cached Chunks
+    // must be freed while the mixer is still open.
+    drop(voice_player);
     if audio_available {
         stop_music();
         sdl2::mixer::close_audio();
@@ -1001,7 +1257,7 @@ fn handle_escape(game: &mut GameLoop) -> bool {
 /// `game.phase_handler` by copy/clone *before* passing `game` to sub-handlers.
 /// Phase transitions replace `game.phase_handler` wholesale rather than
 /// mutating through a partial borrow.
-fn handle_phase_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset) {
+fn handle_phase_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset, sfx: &mut SfxManager, voice: &mut Option<VoicePlayer>) {
     // Take a snapshot of the current phase discriminant to route input.
     // We avoid borrowing game.phase_handler across the handler calls.
     enum Route {
@@ -1026,10 +1282,10 @@ fn handle_phase_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset) {
 
     match route {
         Route::Paused => handle_pause_input(game, event),
-        Route::Office => handle_office_input(game, event, ruleset),
+        Route::Office => handle_office_input(game, event, ruleset, voice),
         Route::Travel => { /* No player input during travel */ }
         Route::Deployment => handle_deployment_input(game, event),
-        Route::Combat => handle_combat_input(game, event),
+        Route::Combat => handle_combat_input(game, event, sfx, voice),
         Route::Extraction => handle_extraction_input(game, event),
         Route::Debrief => handle_debrief_input(game, event),
     }
@@ -1088,7 +1344,7 @@ fn handle_pause_input(game: &mut GameLoop, event: &Event) {
 /// - World map (wall, right)     → World Map / Intel
 /// - Door (far right)            → Begin Mission
 /// - Magazines (desk, left)      → Equipment catalog
-fn handle_office_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset) {
+fn handle_office_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset, voice: &mut Option<VoicePlayer>) {
     // Get current sub-phase.
     let current_sub = if let PhaseHandler::Office { sub_phase } = &game.phase_handler {
         *sub_phase
@@ -1156,6 +1412,11 @@ fn handle_office_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset) {
                                 info!(name = %merc.name, cost = merc.fee_hire,
                                       remaining_funds = game.game_state.funds, "Hired mercenary");
                                 game.game_state.team.push(active);
+                                // Play the mercs voice line on hire — the original game
+                                // plays a greeting/intro clip when you add someone to your team.
+                                if let Some(vp) = voice.as_mut() {
+                                    vp.play(&merc.name);
+                                }
                             }
                         } else {
                             info!(name = %merc.name, "Merc unavailable for hire");
@@ -1622,7 +1883,7 @@ fn handle_deployment_input(game: &mut GameLoop, event: &Event) {
 /// - Mouse wheel: zoom in/out
 ///
 /// When AI is acting, player input is blocked.
-fn handle_combat_input(game: &mut GameLoop, event: &Event) {
+fn handle_combat_input(game: &mut GameLoop, event: &Event, sfx: &mut SfxManager, voice: &mut Option<VoicePlayer>) {
     // Check if the AI is acting — block player input if so.
     let ai_acting = match &game.phase_handler {
         PhaseHandler::Combat(c) => c.ai_acting,
@@ -1661,6 +1922,14 @@ fn handle_combat_input(game: &mut GameLoop, event: &Event) {
                     c.selected_unit_id = Some(living[c.tab_cycle_index]);
                     debug!(selected = ?c.selected_unit_id, "Tab-cycled to next player unit");
                 }
+                    // Play a voice line for the newly-selected merc so the player
+                    // gets audio feedback on who they just tabbed to.
+                    let sel_id = living[c.tab_cycle_index];
+                    if let Some(vp) = voice.as_mut() {
+                        if let Some(merc) = game.game_state.team.iter().find(|m| m.id == sel_id) {
+                            vp.play(&merc.name);
+                        }
+                    }
             }
         }
 
@@ -1788,6 +2057,15 @@ fn handle_combat_input(game: &mut GameLoop, event: &Event) {
                         }
                     }
 
+                    // Play gunshot SFX first (always plays on a shot attempt),
+                    // then layer a hit/kill sound on top if applicable.
+                    sfx.play(CombatSound::Pistol);
+                    match log_msg.1 {
+                        CombatLogKind::Kill => sfx.play(CombatSound::Kill),
+                        CombatLogKind::Miss => sfx.play(CombatSound::Miss),
+                        _ => {} // Hit uses just the gunshot
+                    }
+
                     // Push the combat log entry (outside the enemy borrow).
                     log_combat(game, log_msg.0, log_msg.1);
                 } else {
@@ -1888,7 +2166,7 @@ fn handle_extraction_input(game: &mut GameLoop, event: &Event) {
         } => {
             info!("Extraction complete -- transitioning to Debrief");
             game.game_state.set_phase(GamePhase::Debrief);
-            game.phase_handler = PhaseHandler::Debrief { success: true };
+            game.phase_handler = PhaseHandler::Debrief { success: true, anim_elapsed_ms: 0 };
         }
         Event::KeyDown {
             keycode: Some(key @ (Keycode::W | Keycode::A | Keycode::S | Keycode::D)),
@@ -1951,26 +2229,35 @@ fn apply_camera_scroll(camera: &mut Camera, key: Keycode) {
 // ===========================================================================
 
 /// Tick the current phase's update logic.
-fn update_phase(game: &mut GameLoop, delta_ms: u32) {
+fn update_phase(game: &mut GameLoop, delta_ms: u32, sfx: &mut SfxManager) {
     // Snapshot the phase discriminant to avoid borrowing game.phase_handler
     // across the update call.
     enum UpdateRoute {
         Travel,
         Combat,
+        Debrief,
         Other,
     }
 
     let route = match &game.phase_handler {
         PhaseHandler::Travel { .. } => UpdateRoute::Travel,
         PhaseHandler::Combat(_) => UpdateRoute::Combat,
+        PhaseHandler::Debrief { .. } => UpdateRoute::Debrief,
         _ => UpdateRoute::Other,
     };
 
     match route {
         UpdateRoute::Travel => update_travel(game, delta_ms),
-        UpdateRoute::Combat => update_combat(game, delta_ms),
+        UpdateRoute::Combat => update_combat(game, delta_ms, sfx),
+        UpdateRoute::Debrief => {
+            // Tick the accountant animation timer so sprite frames cycle
+            // on the video phone during the debrief screen.
+            if let PhaseHandler::Debrief { anim_elapsed_ms, .. } = &mut game.phase_handler {
+                *anim_elapsed_ms = anim_elapsed_ms.saturating_add(delta_ms);
+            }
+        }
         UpdateRoute::Other => {
-            // Office, Deployment, Extraction, Debrief, Paused:
+            // Office, Deployment, Extraction, Paused:
             // No per-frame update logic (purely input-driven).
         }
     }
@@ -2000,7 +2287,7 @@ fn update_travel(game: &mut GameLoop, delta_ms: u32) {
 ///
 /// When it's an enemy's turn, the AI picks and executes one action per frame.
 /// This gives a visible cadence to enemy actions and keeps the frame rate smooth.
-fn update_combat(game: &mut GameLoop, _delta_ms: u32) {
+fn update_combat(game: &mut GameLoop, _delta_ms: u32, sfx: &mut SfxManager) {
     // -- AI turn processing --
     let ai_acting = match &game.phase_handler {
         PhaseHandler::Combat(c) => c.ai_acting,
@@ -2054,6 +2341,9 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32) {
                                 let hit_chance = (enemy_wsk as u32).min(80);
                                 let roll: u32 = rng.gen_range(0..100);
 
+                                // Enemy fires — play gunshot SFX regardless of hit/miss.
+                                sfx.play(CombatSound::Rifle);
+
                                 if roll < hit_chance {
                                     let damage = rng.gen_range(3..15);
                                     if let Some(merc) =
@@ -2068,10 +2358,12 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32) {
                                             "Enemy HIT player merc!"
                                         );
                                         if merc.current_hp == 0 {
+                                            sfx.play(CombatSound::Kill);
                                             log_combat(game,
                                                 format!("{enemy_name} hits {target_name} for {damage} damage! {target_name} KILLED!"),
                                                 CombatLogKind::Kill);
                                         } else {
+                                            sfx.play(CombatSound::Hit);
                                             log_combat(game,
                                                 format!("{enemy_name} hits {target_name} for {damage} damage!"),
                                                 CombatLogKind::EnemyHit);
@@ -2079,6 +2371,7 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32) {
                                     }
                                 } else {
                                     info!(enemy = %enemy_name, "Enemy MISSED!");
+                                    sfx.play(CombatSound::Miss);
                                     log_combat(
                                         game,
                                         format!("{enemy_name} misses {target_name}!"),
@@ -2140,7 +2433,7 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32) {
             CombatLogKind::Kill,
         );
         game.game_state.set_phase(GamePhase::Debrief);
-        game.phase_handler = PhaseHandler::Debrief { success: false };
+        game.phase_handler = PhaseHandler::Debrief { success: false, anim_elapsed_ms: 0 };
         return;
     }
 
@@ -2181,7 +2474,7 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32) {
         );
 
         game.game_state.set_phase(GamePhase::Debrief);
-        game.phase_handler = PhaseHandler::Debrief { success: true };
+        game.phase_handler = PhaseHandler::Debrief { success: true, anim_elapsed_ms: 0 };
     }
 }
 
@@ -2205,6 +2498,10 @@ fn render_phase(
     loaded_map: &Option<ow_data::map_loader::GameMap>,
     mission_iso: &Option<IsoConfig>,
     soldier_texture: &Option<Texture>,
+    acct_textures: &[Texture],
+    phone_textures: &[Texture],
+    soldier_textures: &[Option<Texture>],
+    soldier_anims: &[ow_render::anim_controller::AnimController],
 ) {
     match &game.phase_handler {
         PhaseHandler::Office { sub_phase } => {
@@ -2223,6 +2520,8 @@ fn render_phase(
                 tc,
                 &game.enemies,
                 soldier_texture,
+                soldier_textures,
+                soldier_anims,
             );
         }
         PhaseHandler::Combat(_) => {
@@ -2237,10 +2536,14 @@ fn render_phase(
                 tc,
                 &game.enemies,
                 soldier_texture,
+                soldier_textures,
+                soldier_anims,
             );
         }
         PhaseHandler::Extraction => render_extraction(game, canvas),
-        PhaseHandler::Debrief { success } => render_debrief(game, canvas, *success, text, tc),
+        PhaseHandler::Debrief { success, anim_elapsed_ms } => {
+            render_debrief(game, canvas, *success, *anim_elapsed_ms, text, tc, acct_textures, phone_textures)
+        }
         PhaseHandler::Paused { .. } => render_pause(canvas, text, tc),
     }
 }
@@ -2788,84 +3091,79 @@ fn render_mission_map(
     _tc: &TextureCreator<WindowContext>,
     enemies: &[ow_core::mission_setup::EnemyUnit],
     soldier_texture: &Option<Texture>,
+    soldier_textures: &[Option<Texture>],
+    soldier_anims: &[ow_render::anim_controller::AnimController],
 ) {
     // If we have real tile data, render the actual map. Otherwise fall back
     // to the wireframe placeholder grid.
     if let (Some(tr), Some(map), Some(iso)) = (tile_renderer, loaded_map, mission_iso) {
         tr.render_map(canvas, map, &game.camera, iso);
 
-        // === OBJ overlay pass ===
-        // Overlay indices >= 100 in layer1/layer2 reference the OBJ sprite sheet
-        // (buildings, scenery objects) rather than the TIL tileset. We draw them
-        // in a second pass after terrain, using the same painter's algorithm order.
-        //
-        // OBJ sprites are 128x128 (taller than 128x63 terrain tiles), so we
-        // offset them upward by (obj_height - tile_height) so they sit ON the
-        // terrain rather than floating below it.
+        // === OBJ sprite pass (Cell Word 5) ===
+        // Objects (buildings, trees, walls, fences) are stored in Cell Word 5
+        // with an 8-bit object_id (0=none, 1-255=OBJ sprite index).
+        // This replaces the old hack of subtracting 100 from overlay indices.
         if let Some(or) = obj_renderer {
             let (min_x, min_y, max_x, max_y) = game.camera.visible_tile_bounds(iso);
             let min_x = min_x.max(0) as usize;
             let min_y = min_y.max(0) as usize;
             let max_x = (max_x as usize).min(map.width().saturating_sub(1));
-            let max_y = (max_y as usize).min(map.active_rows().saturating_sub(1));
+            let max_y = (max_y as usize).min(map.height().saturating_sub(1));
 
             let obj_pw = or.tile_pixel_width() as f32;
             let obj_ph = or.tile_pixel_height() as f32;
-            let tile_ph = tr.tile_pixel_height() as f32;
-            // Vertical offset so the bottom of the OBJ sprite aligns with the
-            // bottom of the terrain tile it sits on.
-            let y_offset_base = obj_ph - tile_ph;
+            // OBJ sprites are often taller than terrain tiles (e.g. 128x128 vs 128x64).
+            // Offset upward so the bottom of the OBJ sprite sits on the terrain surface.
+            let tile_h = 64.0_f32; // staggered grid tile height
+            let y_offset_base = obj_ph - tile_h;
 
             let mut objs_drawn: u32 = 0;
 
-            // OBJ index = overlay_value - 100 (overlay 101 -> OBJ sprite 1, etc.)
-            const OBJ_OVERLAY_THRESHOLD: u16 = 100;
-
             for ty in min_y..=max_y {
                 for tx in min_x..=max_x {
-                    let tile = match map.get_tile(tx, ty) {
-                        Some(t) => t,
+                    // Access the full MapCell to read object_id from Word 5.
+                    let cell = match map.get_cell(tx, ty) {
+                        Some(c) => c,
                         None => continue,
                     };
-                    if tile.is_border {
+
+                    // object_id == 0 or 255 means no object in this cell.
+                    // The game uses 0xFF as the "empty" sentinel (10079/10080 cells
+                    // have object_id=255 in a typical map).
+                    if cell.object_id == 0 || cell.object_id == 255 {
                         continue;
                     }
 
-                    for overlay_layer in [tile.layer1, tile.layer2] {
-                        if overlay_layer < OBJ_OVERLAY_THRESHOLD {
-                            continue;
-                        }
+                    let obj_idx = cell.object_id as usize;
+                    let obj_tex = match or.get_texture(obj_idx) {
+                        Some(t) => t,
+                        None => continue,
+                    };
 
-                        let obj_idx = (overlay_layer - OBJ_OVERLAY_THRESHOLD) as usize;
-                        let obj_tex = match or.get_texture(obj_idx) {
-                            Some(t) => t,
-                            None => continue,
-                        };
+                    // Position the OBJ sprite at this cell's screen location.
+                    let world_pos = iso.tile_to_screen(TilePos {
+                        x: tx as i32,
+                        y: ty as i32,
+                    });
+                    let screen_pos = game.camera.world_to_screen(world_pos);
 
-                        let world_pos = iso.tile_to_screen(TilePos {
-                            x: tx as i32,
-                            y: ty as i32,
-                        });
-                        let screen_pos = game.camera.world_to_screen(world_pos);
+                    // Draw at top-left of tile position, offset up by the
+                    // height difference so OBJ sprites sit on the terrain.
+                    let draw_x = screen_pos.x;
+                    let draw_y = screen_pos.y - (y_offset_base * game.camera.zoom);
 
-                        // Center horizontally on the tile position, offset up
-                        // so the sprite base aligns with the terrain surface.
-                        let draw_x = screen_pos.x - (obj_pw * game.camera.zoom) / 2.0;
-                        let draw_y = screen_pos.y - (y_offset_base * game.camera.zoom);
+                    let dst_w = (obj_pw * game.camera.zoom) as u32;
+                    let dst_h = (obj_ph * game.camera.zoom) as u32;
 
-                        let dst_w = (obj_pw * game.camera.zoom) as u32;
-                        let dst_h = (obj_ph * game.camera.zoom) as u32;
-
-                        let dst = Rect::new(draw_x as i32, draw_y as i32, dst_w, dst_h);
-                        if let Err(e) = canvas.copy(obj_tex, None, dst) {
-                            trace!(tx, ty, obj_idx, error = %e, "OBJ sprite draw failed");
-                        }
-                        objs_drawn += 1;
+                    let dst = Rect::new(draw_x as i32, draw_y as i32, dst_w, dst_h);
+                    if let Err(e) = canvas.copy(obj_tex, None, dst) {
+                        trace!(tx, ty, obj_idx, error = %e, "OBJ sprite draw failed");
                     }
+                    objs_drawn += 1;
                 }
             }
 
-            trace!(objs_drawn, "OBJ overlay pass complete");
+            trace!(objs_drawn, "OBJ pass complete (Cell Word 5)");
         }
     } else {
         render_placeholder_grid(canvas, &game.camera, &game.iso_config);
@@ -2891,46 +3189,42 @@ fn render_mission_map(
 
             let is_selected = selected_id == Some(merc.id);
 
-            if let Some(sld_tex) = soldier_texture {
-                // Draw the soldier sprite centered on the tile position.
-                // The sprite's origin (stored in the frame header) defines the
-                // anchor point — we position so that the origin aligns with the
-                // tile's screen position.
-                //
-                // JUNGSLD.DAT frames are 128x138 with origin (256, 148).
-                // The origin_x=256 is 2x the frame width (likely fixed-point or
-                // dual-purpose), so we use frame_width/2 as the horizontal anchor.
-                // The origin_y=148 places the anchor ~10px below the frame bottom,
-                // which positions the soldier's feet on the tile surface.
-                // The soldier is a tiny ~6x13 pixel figure at the bottom-center
-                // of the 128x138 frame (around x=60-70, y=122-136).
-                // We crop to just the soldier region and draw it small on the tile.
-                // Source rect: crop the 128x138 texture to the soldier area.
-                // Draw the full 128x138 sprite but scaled down to fit a tile.
-                // The soldier figure is tiny within the frame but the frame also
-                // has the isometric footprint diamond — drawing the full frame
-                // at tile size gives correct positioning.
-                let draw_w = (64.0 * game.camera.zoom) as u32;
-                let draw_h = (70.0 * game.camera.zoom) as u32;
-                let draw_x = screen.x - (draw_w as f32 / 2.0);
-                let draw_y = screen.y - draw_h as f32;
+            // Try animated frame first (from COR/DAT system), then fall
+            // back to the single static texture if animations aren't loaded.
+            let merc_idx = game.game_state.team.iter().position(|m| m.id == merc.id);
+            let anim_frame_tex = merc_idx
+                .and_then(|idx| soldier_anims.get(idx))
+                .map(|ctrl| ctrl.current_frame_index() as usize)
+                .and_then(|fi| soldier_textures.get(fi))
+                .and_then(|opt| opt.as_ref());
+
+            let tex_to_draw = anim_frame_tex.or(soldier_texture.as_ref());
+
+            if let Some(sld_tex) = tex_to_draw {
+                // Draw the sprite frame at tile position. Frames are 128x138
+                // with the soldier figure inside an isometric footprint.
+                let sprite_w = 128.0;
+                let sprite_h = 138.0;
+                let draw_w = (sprite_w * game.camera.zoom) as u32;
+                let draw_h = (sprite_h * game.camera.zoom) as u32;
+                let draw_x = screen.x;
+                let draw_y = screen.y - ((sprite_h - 64.0) * game.camera.zoom);
 
                 let dst = Rect::new(draw_x as i32, draw_y as i32, draw_w, draw_h);
-                canvas.copy(sld_tex, None, dst).ok();
 
-                // Also draw a green dot so the unit is always visible
-                // even if the sprite is too faint at this zoom level.
-                let dot_color = if is_selected {
-                    Color::RGB(255, 255, 0)
+                // Check if the animation requires horizontal mirroring.
+                let mirror = merc_idx
+                    .and_then(|idx| soldier_anims.get(idx))
+                    .map(|ctrl| ctrl.mirror_horizontal())
+                    .unwrap_or(false);
+
+                if mirror {
+                    canvas.copy_ex(sld_tex, None, dst, 0.0, None, true, false).ok();
                 } else {
-                    Color::RGB(0, 220, 0)
-                };
-                canvas.set_draw_color(dot_color);
-                canvas.fill_rect(Rect::new(
-                    screen.x as i32 - 4, screen.y as i32 - 4, 8, 8,
-                )).ok();
+                    canvas.copy(sld_tex, None, dst).ok();
+                }
 
-                // Selection border
+                // Selection highlight
                 if is_selected {
                     canvas.set_draw_color(Color::RGB(255, 255, 0));
                     canvas.draw_rect(Rect::new(
@@ -3140,9 +3434,9 @@ fn render_mission_map(
     if let Some(map) = loaded_map {
         let (win_w, win_h) = (game.window_width, game.window_height);
 
-        // Scale minimap to fit nicely — 200x202 tiles at 1px each.
+        // Scale minimap to fit — 140x72 tiles at 1px each.
         let mm_w = map.width() as u32;
-        let mm_h = map.active_rows() as u32;
+        let mm_h = map.height() as u32;
         let mm_x = win_w as i32 - mm_w as i32 - 15;
         let mm_y = win_h as i32 - mm_h as i32 - 15;
 
@@ -3155,13 +3449,10 @@ fn render_mission_map(
         canvas.set_blend_mode(sdl2::render::BlendMode::None);
 
         // Draw each tile as a colored pixel based on its sprite index.
-        for ty in 0..map.active_rows() {
+        for ty in 0..map.height() {
             for tx in 0..map.width() {
                 if let Some(tile) = map.get_tile(tx, ty) {
-                    if tile.is_border {
-                        continue;
-                    }
-                    let sid = tile.layer0 as u32;
+                    let sid = tile.layer0() as u32;
                     let color = if sid == 0 {
                         Color::RGB(25, 45, 20)
                     } else if sid < 50 {
@@ -3365,23 +3656,138 @@ fn render_extraction(game: &GameLoop, canvas: &mut Canvas<Window>) {
 // Debrief rendering
 // ---------------------------------------------------------------------------
 
-/// Render the debrief screen: large result indicator + "press enter" prompt.
+/// Render the debrief screen with the video phone showing the accountant.
+///
+/// The original game shows the accountant calling on a video phone to
+/// deliver the post-mission financial report. PHONSPR.OBJ frames render
+/// the phone scene background; ACCT.OBJ frames animate the accountant
+/// character talking on screen. The financial text overlay sits to the
+/// right of the phone.
+///
+/// Layout (at 1280x720):
+///   Left half:  phone background + animated accountant sprite
+///   Right half: battle results + financial report text
 fn render_debrief(
     game: &GameLoop,
     canvas: &mut Canvas<Window>,
     success: bool,
+    anim_elapsed_ms: u32,
     text: &TextRenderer,
     tc: &TextureCreator<WindowContext>,
+    acct_textures: &[Texture],
+    phone_textures: &[Texture],
 ) {
     let (w, h) = canvas
         .output_size()
         .unwrap_or((WINDOW_WIDTH, WINDOW_HEIGHT));
 
-    // Dark background
+    // Dark background -- the original game uses a dark charcoal backdrop
+    // behind the phone scene to focus attention on the video call.
     canvas.set_draw_color(Color::RGB(15, 15, 25));
     canvas.clear();
 
-    // Title
+    // -----------------------------------------------------------------------
+    // Left side: Video phone with animated accountant
+    // -----------------------------------------------------------------------
+    // The phone occupies roughly the left 40% of the screen. We draw the
+    // PHONSPR background first, then layer the accountant animation on top.
+
+    // Milliseconds per animation frame -- controls how fast the accountant
+    // cycles through talking/gesturing sprites. 200ms gives a natural feel
+    // for a "talking head" animation without looking jittery.
+    const ACCT_FRAME_PERIOD_MS: u32 = 200;
+
+    // Phone scene background -- use frame 0 as the static backdrop.
+    // The phone sprite is drawn centered in the left portion of the screen.
+    let phone_area_w = (w * 2 / 5) as i32; // left 40% of screen
+    if !phone_textures.is_empty() {
+        let phone_tex = &phone_textures[0];
+        let query = phone_tex.query();
+        // Scale the phone scene to fit nicely in the left panel.
+        // Maintain aspect ratio, fitting to the available height.
+        let scale = ((h as f32 - 60.0) / query.height as f32).min(
+            (phone_area_w as f32 - 40.0) / query.width as f32,
+        );
+        let draw_w = (query.width as f32 * scale) as u32;
+        let draw_h = (query.height as f32 * scale) as u32;
+        let draw_x = (phone_area_w as u32 / 2).saturating_sub(draw_w / 2) as i32 + 20;
+        let draw_y = ((h / 2).saturating_sub(draw_h / 2)) as i32;
+        canvas
+            .copy(
+                phone_tex,
+                None,
+                Some(Rect::new(draw_x, draw_y, draw_w, draw_h)),
+            )
+            .ok();
+
+        // Accountant animation -- cycle through ACCT.OBJ frames on top of
+        // the phone scene. The accountant is composited at the center of
+        // the phone screen area (offset slightly to match the phone bezel).
+        if !acct_textures.is_empty() {
+            // Show frame 0 — the base accountant portrait. Frames 1+ are
+            // mouth visemes driven by VLS lip-sync data during audio playback.
+            // TODO: Wire up VLS viseme timeline to swap frames during voice playback.
+            let frame_idx = 0;
+            let acct_tex = &acct_textures[frame_idx];
+            let aq = acct_tex.query();
+            // Scale accountant to fit inside the phone screen area.
+            // The accountant should be roughly 60% of the phone's dimensions
+            // to leave room for the phone bezel/frame.
+            let acct_scale = (draw_h as f32 * 0.6 / aq.height as f32).min(
+                draw_w as f32 * 0.6 / aq.width as f32,
+            );
+            let acct_w = (aq.width as f32 * acct_scale) as u32;
+            let acct_h = (aq.height as f32 * acct_scale) as u32;
+            // Center the accountant on the phone screen.
+            let acct_x = draw_x + (draw_w / 2) as i32 - (acct_w / 2) as i32;
+            let acct_y = draw_y + (draw_h / 2) as i32 - (acct_h / 2) as i32;
+            canvas
+                .copy(
+                    acct_tex,
+                    None,
+                    Some(Rect::new(acct_x, acct_y, acct_w, acct_h)),
+                )
+                .ok();
+        }
+    } else {
+        // Fallback: no phone sprites loaded -- draw a placeholder phone frame
+        // so the screen is not completely empty on the left side.
+        let phone_rect = Rect::new(40, 80, (phone_area_w - 60) as u32, h - 160);
+        canvas.set_draw_color(Color::RGB(30, 35, 50));
+        canvas.fill_rect(phone_rect).ok();
+        canvas.set_draw_color(Color::RGB(60, 70, 90));
+        canvas.draw_rect(phone_rect).ok();
+        text.draw(
+            canvas,
+            tc,
+            "[ VIDEO PHONE ]",
+            phone_rect.x() + 20,
+            phone_rect.y() + 20,
+            Color::RGB(100, 120, 160),
+        )
+        .ok();
+
+        // Placeholder accountant indicator
+        if acct_textures.is_empty() {
+            text.draw(
+                canvas,
+                tc,
+                "[ ACCOUNTANT ]",
+                phone_rect.x() + 20,
+                phone_rect.y() + 50,
+                Color::RGB(80, 100, 140),
+            )
+            .ok();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Right side: Mission results + financial report
+    // -----------------------------------------------------------------------
+    // The text sits to the right of the phone, starting at ~45% of screen width.
+    let text_x = (w * 9 / 20) as i32;
+
+    // Title banner
     let title = if success {
         "MISSION COMPLETE"
     } else {
@@ -3392,46 +3798,30 @@ fn render_debrief(
     } else {
         Color::RGB(255, 80, 80)
     };
-    text.draw_header(canvas, tc, title, (w / 2 - 150) as i32, 100, title_color)
+    text.draw_header(canvas, tc, title, text_x, 40, title_color)
         .ok();
 
-    // Stats
-    let mut y = 180i32;
+    // -- Battle Results --
+    let mut y = 100i32;
     let survived = game.game_state.team.iter().filter(|m| m.is_alive()).count();
     let total = game.game_state.team.len();
     let killed = game.enemies.iter().filter(|e| e.current_hp == 0).count();
     let total_enemies = game.enemies.len();
 
-    // -- Battle Results --
-    text.draw(
-        canvas,
-        tc,
-        "BATTLE RESULTS",
-        200,
-        y,
-        Color::RGB(180, 180, 100),
-    )
-    .ok();
+    text.draw(canvas, tc, "BATTLE RESULTS", text_x, y, Color::RGB(180, 180, 100))
+        .ok();
     y += 25;
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         &format!("  Mercs survived:      {survived}/{total}"),
-        200,
-        y,
-        Color::RGB(200, 200, 200),
-    )
-    .ok();
+        text_x, y, Color::RGB(200, 200, 200),
+    ).ok();
     y += 20;
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         &format!("  Enemies eliminated:  {killed}/{total_enemies}"),
-        200,
-        y,
-        Color::RGB(200, 200, 200),
-    )
-    .ok();
+        text_x, y, Color::RGB(200, 200, 200),
+    ).ok();
     y += 20;
 
     let kia = total - survived;
@@ -3442,30 +3832,16 @@ fn render_debrief(
         .filter(|m| m.is_alive() && m.current_hp < m.max_hp)
         .count();
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         &format!("  KIA: {}  WIA: {}", kia, wia),
-        200,
-        y,
-        if kia > 0 {
-            Color::RGB(255, 100, 100)
-        } else {
-            Color::RGB(100, 200, 100)
-        },
-    )
-    .ok();
+        text_x, y,
+        if kia > 0 { Color::RGB(255, 100, 100) } else { Color::RGB(100, 200, 100) },
+    ).ok();
     y += 35;
 
-    // -- Financial Report (the accountant's fax) --
-    text.draw(
-        canvas,
-        tc,
-        "FINANCIAL REPORT",
-        200,
-        y,
-        Color::RGB(180, 180, 100),
-    )
-    .ok();
+    // -- Financial Report (the accountant's video phone summary) --
+    text.draw(canvas, tc, "FINANCIAL REPORT", text_x, y, Color::RGB(180, 180, 100))
+        .ok();
     y += 25;
 
     let advance = 324_000i64; // TODO: get from accepted contract
@@ -3478,70 +3854,46 @@ fn render_debrief(
     let profit = total_income - total_expenses;
 
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         &format!("  Contract advance:    ${:>12}", advance),
-        200,
-        y,
-        Color::RGB(150, 200, 150),
-    )
-    .ok();
+        text_x, y, Color::RGB(150, 200, 150),
+    ).ok();
     y += 18;
     if success {
         text.draw(
-            canvas,
-            tc,
+            canvas, tc,
             &format!("  Completion bonus:    ${:>12}", bonus),
-            200,
-            y,
-            Color::RGB(150, 200, 150),
-        )
-        .ok();
+            text_x, y, Color::RGB(150, 200, 150),
+        ).ok();
         y += 18;
     }
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         &format!("  Hiring costs:       -${:>12}", hiring_costs),
-        200,
-        y,
-        Color::RGB(200, 150, 150),
-    )
-    .ok();
+        text_x, y, Color::RGB(200, 150, 150),
+    ).ok();
     y += 18;
     if medical > 0 {
         text.draw(
-            canvas,
-            tc,
+            canvas, tc,
             &format!("  Medical (WIA):      -${:>12}", medical),
-            200,
-            y,
-            Color::RGB(200, 150, 150),
-        )
-        .ok();
+            text_x, y, Color::RGB(200, 150, 150),
+        ).ok();
         y += 18;
     }
     if death_insurance > 0 {
         text.draw(
-            canvas,
-            tc,
+            canvas, tc,
             &format!("  Death insurance:    -${:>12}", death_insurance),
-            200,
-            y,
-            Color::RGB(255, 100, 100),
-        )
-        .ok();
+            text_x, y, Color::RGB(255, 100, 100),
+        ).ok();
         y += 18;
     }
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         "  ─────────────────────────────",
-        200,
-        y,
-        Color::RGB(100, 100, 100),
-    )
-    .ok();
+        text_x, y, Color::RGB(100, 100, 100),
+    ).ok();
     y += 18;
     let profit_color = if profit >= 0 {
         Color::RGB(100, 255, 100)
@@ -3549,35 +3901,23 @@ fn render_debrief(
         Color::RGB(255, 100, 100)
     };
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         &format!("  NET PROFIT:          ${:>12}", profit),
-        200,
-        y,
-        profit_color,
-    )
-    .ok();
+        text_x, y, profit_color,
+    ).ok();
     y += 25;
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         &format!("  Current funds:       ${:>12}", game.game_state.funds),
-        200,
-        y,
-        Color::RGB(200, 200, 200),
-    )
-    .ok();
+        text_x, y, Color::RGB(200, 200, 200),
+    ).ok();
     y += 35;
 
     text.draw(
-        canvas,
-        tc,
+        canvas, tc,
         "Press ENTER to return to office",
-        200,
-        y,
-        Color::RGB(150, 150, 180),
-    )
-    .ok();
+        text_x, y, Color::RGB(150, 150, 180),
+    ).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -3691,7 +4031,7 @@ mod tests {
         assert!(matches!(extract, PhaseHandler::Extraction));
 
         let debrief = phase_handler_for(&GamePhase::Debrief);
-        assert!(matches!(debrief, PhaseHandler::Debrief { success: true }));
+        assert!(matches!(debrief, PhaseHandler::Debrief { success: true, .. }));
     }
 
     #[test]
@@ -3719,8 +4059,8 @@ mod tests {
                 tab_cycle_index: 0,
             }),
             PhaseHandler::Extraction,
-            PhaseHandler::Debrief { success: true },
-            PhaseHandler::Debrief { success: false },
+            PhaseHandler::Debrief { success: true, anim_elapsed_ms: 0 },
+            PhaseHandler::Debrief { success: false, anim_elapsed_ms: 0 },
         ];
 
         let labels: Vec<&str> = handlers.iter().map(phase_label).collect();
@@ -3746,8 +4086,8 @@ mod tests {
                 ai_acting: false,
                 tab_cycle_index: 0,
             }),
-            PhaseHandler::Debrief { success: true },
-            PhaseHandler::Debrief { success: false },
+            PhaseHandler::Debrief { success: true, anim_elapsed_ms: 0 },
+            PhaseHandler::Debrief { success: false, anim_elapsed_ms: 0 },
         ];
 
         let colors: Vec<Color> = handlers.iter().map(phase_background_color).collect();

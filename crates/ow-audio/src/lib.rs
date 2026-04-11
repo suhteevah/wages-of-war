@@ -28,7 +28,9 @@
 //! ```
 
 pub mod music;
+pub mod sfx;
 pub mod vla_parser;
+pub mod voice;
 pub mod wav_loader;
 
 use std::path::PathBuf;

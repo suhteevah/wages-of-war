@@ -11,25 +11,26 @@
 //! 2. **Render frame** — Each frame, iterate visible tiles in painter's
 //!    algorithm order and blit the corresponding tile texture to the canvas.
 //!
+//! ## Staggered grid projection
+//!
+//! Wages of War uses a **staggered isometric grid** — NOT the standard
+//! diamond projection. Tile positions are:
+//! ```text
+//! screen_x = col * 128
+//! screen_y = row * 64
+//! if row is odd: screen_x += 64   // half-tile stagger
+//! ```
+//!
 //! ## Painter's algorithm and draw order
 //!
-//! Isometric rendering requires drawing tiles from back to front so that
-//! closer tiles correctly overlap farther ones. In a standard diamond-grid
-//! isometric projection:
-//!
-//! - Tiles with smaller Y come first (they are "further back" on screen).
-//! - Within the same Y row, tiles with smaller X come first.
-//!
-//! This back-to-front order ensures that tiles closer to the camera (higher Y,
-//! higher X) are drawn on top of tiles further away, producing correct
-//! occlusion without a depth buffer.
+//! Tiles are drawn in row-major order (low row to high row, low col to high
+//! col within each row). This back-to-front order produces correct occlusion.
 //!
 //! ## Frustum culling
 //!
-//! Only tiles within the camera's visible bounds are drawn. The camera
-//! computes the tile coordinate range that maps to the screen viewport,
-//! and we skip everything outside that range. For a 200x252 map this
-//! avoids drawing ~50,000 tiles per frame when only ~500 are visible.
+//! Only tiles within the camera's visible bounds are drawn. For a 140x72
+//! map (~10K cells) this avoids drawing the entire grid when only a few
+//! hundred tiles are visible on screen.
 
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
@@ -179,16 +180,10 @@ impl<'tc> TileMapRenderer<'tc> {
     ///
     /// ## Draw order
     ///
-    /// The painter's algorithm for isometric grids draws in row-major order
-    /// with increasing Y first (further rows are "behind"), then increasing X
-    /// within each row. This ensures tiles in the foreground correctly
-    /// overdraw tiles in the background.
-    ///
-    /// ## Frustum culling
-    ///
-    /// Only tiles within `camera.visible_tile_bounds()` are considered.
-    /// Additionally, border tiles (marked `is_border == true` in the map data)
-    /// are skipped — these are padding cells that contain no meaningful graphics.
+    /// Draws tiles in row-major order (back to front) within the camera's
+    /// visible bounds. Uses the staggered grid projection — `tile_to_screen`
+    /// already handles the odd-row half-tile offset, so we draw each tile
+    /// at its top-left screen position with no additional centering.
     pub fn render_map(
         &self,
         canvas: &mut Canvas<Window>,
@@ -198,18 +193,16 @@ impl<'tc> TileMapRenderer<'tc> {
     ) {
         let (min_x, min_y, max_x, max_y) = camera.visible_tile_bounds(iso);
 
-        // Clamp bounds to the actual map dimensions to avoid out-of-bounds lookups.
+        // Clamp bounds to the 140x72 grid.
         let min_x = min_x.max(0) as usize;
         let min_y = min_y.max(0) as usize;
         let max_x = (max_x as usize).min(map.width().saturating_sub(1));
-        let max_y = (max_y as usize).min(map.active_rows().saturating_sub(1));
+        let max_y = (max_y as usize).min(map.height().saturating_sub(1));
 
         let mut tiles_drawn: u32 = 0;
         let mut tiles_skipped: u32 = 0;
 
-        // Painter's algorithm: iterate rows from back (low Y) to front (high Y),
-        // and within each row from left (low X) to right (high X).
-        // This ensures correct occlusion in the isometric diamond projection.
+        // Painter's algorithm: row-major order, low row (back) to high row (front).
         for ty in min_y..=max_y {
             for tx in min_x..=max_x {
                 let tile = match map.get_tile(tx, ty) {
@@ -217,16 +210,9 @@ impl<'tc> TileMapRenderer<'tc> {
                     None => continue,
                 };
 
-                // Skip border/padding cells — they have no valid tile graphics.
-                if tile.is_border {
-                    tiles_skipped += 1;
-                    continue;
-                }
-
-                // Look up the tile texture by the primary terrain layer.
-                // layer0 is a 9-bit index (0-511) into the TIL sprite sheet,
-                // already unpacked by the MAP parser from the packed u32 cell word.
-                let tex_idx = tile.layer0 as usize;
+                // Look up the tile texture by the primary terrain layer index.
+                // tile_layer_0 is a 9-bit index (0-511) into the TIL sprite sheet.
+                let tex_idx = tile.layer0() as usize;
                 let texture = match self.tile_textures.get(tex_idx) {
                     Some(Some(tex)) => tex,
                     _ => {
@@ -235,46 +221,43 @@ impl<'tc> TileMapRenderer<'tc> {
                     }
                 };
 
-                // Convert tile grid position to world-space screen coordinates
-                // using the isometric projection.
+                // Convert tile grid position to world-space pixel coordinates.
+                // The staggered grid projection gives us the top-left corner of
+                // the tile's bounding rectangle — no centering offset needed.
                 let world_pos = iso.tile_to_screen(TilePos {
                     x: tx as i32,
                     y: ty as i32,
                 });
 
-                // Apply camera transform to get final screen position.
+                // Apply camera transform to get final on-screen position.
                 let screen_pos = camera.world_to_screen(world_pos);
 
-                // The tile texture's anchor point is its top-left corner.
-                // For diamond isometric tiles, the tile_to_screen gives us the
-                // top center of the diamond. We need to offset left by half
-                // the tile pixel width so the diamond is centered on the grid point.
-                let draw_x = screen_pos.x - (self.tile_pixel_width as f32 * camera.zoom) / 2.0;
+                let draw_x = screen_pos.x;
                 let draw_y = screen_pos.y;
 
-                let dst_w = (self.tile_pixel_width as f32 * camera.zoom) as u32;
-                let dst_h = (self.tile_pixel_height as f32 * camera.zoom) as u32;
+                // Use the grid's tile dimensions (128x64) for the destination rect,
+                // NOT the sprite's pixel dimensions (128x63). The sprites are 1px
+                // shorter than the grid spacing — the exe uses 64px row spacing
+                // (confirmed by sar 6 = /64) and stretches the 63px sprite to fill.
+                let dst_w = (iso.tile_width * camera.zoom) as u32;
+                let dst_h = (iso.tile_height * camera.zoom) as u32;
 
                 let dst = Rect::new(draw_x as i32, draw_y as i32, dst_w, dst_h);
                 if let Err(e) = canvas.copy(texture, None, dst) {
                     warn!(tx, ty, error = %e, "failed to draw tile");
                 }
 
-                // Render overlay layers (layer1 and layer2) on top of the base tile.
-                // These contain buildings, paths, vegetation, and detail sprites
-                // composited over the base terrain.
-                // Skip indices 500+ — these are marker/debug sprites in the TIL file
-                // (tiny sprites with ~213 bytes, not real terrain graphics).
-                for overlay_layer in [tile.layer1, tile.layer2] {
-                    // Only render overlays with low tile indices (1-99).
-                    // Higher indices (100+) include marker sprites, debug tiles,
-                    // and object-layer references that need the OBJ sprite sheet.
-                    if overlay_layer > 0 && overlay_layer < 100 {
+                // Render tile overlay layers (layer1, layer2) on top of the base.
+                // These come from Word 1 of the cell and use the same TIL sprite sheet.
+                // All 512 valid indices can appear here (unlike objects which use
+                // the OBJ sprite sheet via Word 5).
+                for overlay_idx in [tile.layer1(), tile.layer2()] {
+                    if overlay_idx > 0 {
                         if let Some(Some(overlay_tex)) =
-                            self.tile_textures.get(overlay_layer as usize)
+                            self.tile_textures.get(overlay_idx as usize)
                         {
                             if let Err(e) = canvas.copy(overlay_tex, None, dst) {
-                                trace!(tx, ty, layer = overlay_layer, error = %e, "overlay draw failed");
+                                trace!(tx, ty, layer = overlay_idx, error = %e, "overlay draw failed");
                             }
                         }
                     }

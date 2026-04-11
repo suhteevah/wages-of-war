@@ -4,6 +4,7 @@
 //! the game loop. Pass `--data-only` to skip rendering and just validate
 //! all data files (the original proof-of-concept mode).
 
+mod avi_player;
 mod game_loop;
 
 use std::path::PathBuf;
@@ -100,9 +101,31 @@ fn main() -> anyhow::Result<()> {
         .resizable()
         .build()?;
 
-    let canvas = window.into_canvas().accelerated().present_vsync().build()?;
+    let mut canvas = window.into_canvas().accelerated().present_vsync().build()?;
 
     info!("SDL2 window created (1280x720)");
+
+    // -----------------------------------------------------------------------
+    // Play intro cutscenes (logos, opening cinematic).
+    // The original game shows: 3DO logo → New World logo → Random Games logo → Opening.
+    // Player can skip each with Escape/Space/Enter.
+    // -----------------------------------------------------------------------
+    let mut event_pump = sdl_context
+        .event_pump()
+        .map_err(|e| anyhow::anyhow!("SDL2 event pump failed: {e}"))?;
+    let texture_creator = canvas.texture_creator();
+    let avi_dir = args.data_dir.join("WOW").join("AVI");
+
+    // Play intro sequence — each can be skipped individually.
+    for avi_name in ["WOWLOGO.AVI", "NWLOGO.AVI", "RANDOM.AVI", "OPENING.AVI"] {
+        let avi_path = avi_dir.join(avi_name);
+        if avi_path.exists() {
+            if !avi_player::play_avi(&mut canvas, &texture_creator, &mut event_pump, &avi_path) {
+                info!("user skipped intro sequence at {avi_name}");
+                break; // Skip pressed — jump straight to game
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Create game state and launch the game loop.
@@ -111,7 +134,7 @@ fn main() -> anyhow::Result<()> {
     let game_state = ow_core::game_state::GameState::new(500_000);
     info!(phase = ?game_state.phase, "Entering game loop");
 
-    game_loop::run_game_loop(&sdl_context, canvas, game_state, ruleset, &args.data_dir)?;
+    game_loop::run_game_loop_with_pump(&sdl_context, canvas, event_pump, game_state, ruleset, &args.data_dir)?;
 
     info!("Open Wages shutting down cleanly");
     Ok(())
