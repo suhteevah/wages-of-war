@@ -262,9 +262,11 @@ impl<'tc> TileMapRenderer<'tc> {
 
                 // Render overlay layers (layer1 and layer2) on top of the base tile.
                 // These contain buildings, paths, vegetation, and detail sprites
-                // that are composited over the base terrain.
+                // composited over the base terrain.
+                // Skip indices 500+ — these are marker/debug sprites in the TIL file
+                // (tiny sprites with ~213 bytes, not real terrain graphics).
                 for overlay_layer in [tile.layer1, tile.layer2] {
-                    if overlay_layer > 0 {
+                    if overlay_layer > 0 && overlay_layer < 380 {
                         if let Some(Some(overlay_tex)) = self.tile_textures.get(overlay_layer as usize) {
                             if let Err(e) = canvas.copy(overlay_tex, None, dst) {
                                 trace!(tx, ty, layer = overlay_layer, error = %e, "overlay draw failed");
