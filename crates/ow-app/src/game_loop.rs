@@ -2902,23 +2902,19 @@ fn render_mission_map(
                 // dual-purpose), so we use frame_width/2 as the horizontal anchor.
                 // The origin_y=148 places the anchor ~10px below the frame bottom,
                 // which positions the soldier's feet on the tile surface.
-                let query = sld_tex.query();
-                let sprite_w = query.width as f32;
-                let sprite_h = query.height as f32;
+                // The soldier is a tiny ~6x13 pixel figure at the bottom-center
+                // of the 128x138 frame (around x=60-70, y=122-136).
+                // We crop to just the soldier region and draw it small on the tile.
+                // Source rect: crop the 128x138 texture to the soldier area.
+                let src_rect = Rect::new(55, 118, 20, 20); // 20x20 crop around the soldier
 
-                // Scale the sprite with the camera zoom
-                let draw_w = (sprite_w * game.camera.zoom) as u32;
-                let draw_h = (sprite_h * game.camera.zoom) as u32;
+                // Draw small — the soldier should be about 12x12 pixels on screen at 1x zoom
+                let draw_size = (14.0 * game.camera.zoom) as u32;
+                let draw_x = screen.x - (draw_size as f32 / 2.0);
+                let draw_y = screen.y - draw_size as f32;
 
-                // Anchor: center horizontally on tile, bottom of frame at tile surface
-                let anchor_x = sprite_w / 2.0; // horizontal center of frame
-                let anchor_y = sprite_h;        // bottom of frame
-
-                let draw_x = screen.x - (anchor_x * game.camera.zoom);
-                let draw_y = screen.y - (anchor_y * game.camera.zoom);
-
-                let dst = Rect::new(draw_x as i32, draw_y as i32, draw_w, draw_h);
-                canvas.copy(sld_tex, None, dst).ok();
+                let dst = Rect::new(draw_x as i32, draw_y as i32, draw_size, draw_size);
+                canvas.copy(sld_tex, Some(src_rect), dst).ok();
 
                 // Draw selection indicator under selected unit
                 if is_selected {
@@ -2927,8 +2923,8 @@ fn render_mission_map(
                         .draw_rect(Rect::new(
                             draw_x as i32 - 1,
                             draw_y as i32 - 1,
-                            draw_w + 2,
-                            draw_h + 2,
+                            draw_size + 2,
+                            draw_size + 2,
                         ))
                         .ok();
                 }
