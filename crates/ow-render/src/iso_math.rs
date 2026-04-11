@@ -68,13 +68,15 @@ impl IsoConfig {
     /// contains two interlocked sub-rows at 32px spacing. The cell index
     /// formula `row * 140 + col` maps to visual rows spaced 32px apart.
     pub fn tile_to_screen(&self, tile: TilePos) -> ScreenPos {
-        let half_h = self.tile_height / 2.0;
         let mut sx = self.origin_x + tile.x as f32 * self.tile_width;
-        // Half-height row spacing: diamonds overlap vertically by 50%,
-        // creating the seamless interlocking pattern.
-        let sy = self.origin_y + tile.y as f32 * half_h;
+        // Half-height row spacing (32px) so diamond tiles interlock.
+        // The exe's CellToScreen uses row*64 because it renders to a back
+        // buffer where WinG handles the compositing. We need half-height
+        // for SDL2's painter's algorithm to fill the diamond gaps correctly.
+        let sy = self.origin_y + tile.y as f32 * (self.tile_height / 2.0);
 
-        // Staggered grid: odd rows shifted right by half a tile width.
+        // Odd rows stagger right by half tile width (64px), as per
+        // the exe's CellToScreen: if (row % 2 == 1) screen_x += 64.
         if tile.y % 2 != 0 {
             sx += self.tile_width / 2.0;
         }
@@ -85,18 +87,16 @@ impl IsoConfig {
 
     /// Convert screen/world pixel coordinates to tile grid position.
     ///
-    /// Uses half-height row spacing to match the forward projection.
-    /// The exe's ScreenToCell at 0x45FE11 uses `y / 64` because each
-    /// 64px band contains two interlocked rows at 32px spacing.
+    /// Mirrors the exe's ScreenToCell: row = y/64, col = x/128.
     pub fn screen_to_tile(&self, screen: ScreenPos) -> TilePos {
         let half_w = self.tile_width / 2.0;
         let half_h = self.tile_height / 2.0;
 
-        // Add half-tile offsets for centering (matches the +64, +32 in the exe).
+        // Add half-tile offsets for centering (the exe adds +64, +32).
         let x = screen.x - self.origin_x + half_w;
-        let y = screen.y - self.origin_y + half_h / 2.0;
+        let y = screen.y - self.origin_y + half_h;
 
-        // Coarse row from half-height spacing.
+        // Row from half-height spacing (32px per row for interlocking).
         let row = (y / half_h).floor() as i32;
         let col_raw = x - if row % 2 != 0 { half_w } else { 0.0 };
         let col = (col_raw / self.tile_width).floor() as i32;

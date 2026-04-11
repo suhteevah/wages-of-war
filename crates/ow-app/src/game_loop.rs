@@ -351,7 +351,9 @@ fn phase_background_color(handler: &PhaseHandler) -> Color {
             OfficePhase::Training => Color::RGB(35, 55, 55),
         },
         PhaseHandler::Travel { .. } => Color::RGB(20, 20, 40),
-        PhaseHandler::Deployment { .. } => Color::RGB(30, 50, 30),
+        // Black background — the original game uses a black back buffer.
+        // Diamond tile corners are transparent and show this color.
+        PhaseHandler::Deployment { .. } => Color::RGB(0, 0, 0),
         PhaseHandler::Combat(_) => Color::RGB(10, 10, 10),
         PhaseHandler::Extraction => Color::RGB(40, 50, 30),
         PhaseHandler::Debrief { success, .. } => {
@@ -779,6 +781,20 @@ pub fn run_game_loop_with_pump(
                     info!("[DEV] F5: +$500k → funds={}", game.game_state.funds);
                 }
 
+                // M: Toggle music mute
+                Event::KeyDown {
+                    keycode: Some(Keycode::M),
+                    ..
+                } => {
+                    if sdl2::mixer::Music::get_volume() > 0 {
+                        sdl2::mixer::Music::set_volume(0);
+                        info!("[DEV] M: Music muted");
+                    } else {
+                        sdl2::mixer::Music::set_volume(64);
+                        info!("[DEV] M: Music unmuted");
+                    }
+                }
+
                 // Delegate all other input to the current phase handler
                 _ => {
                     handle_phase_input(&mut game, &event, &ruleset, &mut sfx_manager, &mut voice_player);
@@ -953,13 +969,18 @@ pub fn run_game_loop_with_pump(
                                             // available, otherwise center on the map.
                                             // Row spacing is half tile height (32px) for
                                             // interlocking diamonds.
+                                            // The exe stores camera coords using 64px row
+                                            // spacing, but we render with 32px (half-height
+                                            // for diamond interlocking). Halve the Y value.
                                             let mid_x = if map.header.camera_x != 0 {
                                                 map.header.camera_x as f32
                                             } else {
                                                 (map.width() as f32 / 2.0) * 128.0
                                             };
+                                            // Camera Y from MAP uses 64px row spacing but
+                                            // we render at 32px (half-height). Halve it.
                                             let mid_y = if map.header.camera_y != 0 {
-                                                map.header.camera_y as f32
+                                                (map.header.camera_y as f32) / 2.0
                                             } else {
                                                 (map.height() as f32 / 2.0) * 32.0
                                             };
@@ -3164,6 +3185,91 @@ fn render_mission_map(
             }
 
             trace!(objs_drawn, "OBJ pass complete (Cell Word 5)");
+        }
+
+        // === Cell Word 2 overlay pass (DISABLED — debugging) ===
+        // TODO: Re-enable once base terrain is verified correct.
+        if false {
+            let (min_x, min_y, max_x, max_y) = game.camera.visible_tile_bounds(iso);
+            let min_x = min_x.max(0) as usize;
+            let min_y = min_y.max(0) as usize;
+            let max_x = (max_x as usize).min(map.width().saturating_sub(1));
+            let max_y = (max_y as usize).min(map.height().saturating_sub(1));
+
+            let dst_w = (iso.tile_width * game.camera.zoom) as u32;
+            let dst_h = (iso.tile_height * game.camera.zoom) as u32;
+            let mut overlays_drawn: u32 = 0;
+
+            for ty in min_y..=max_y {
+                for tx in min_x..=max_x {
+                    let cell = match map.get_cell(tx, ty) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+
+                    // Word 4 elevation: offset the tile vertically based on the
+                    // average corner height. Each unit ≈ 2px of visual offset
+                    // (tuned to look reasonable at 128x64 tile size).
+                    let avg_elev = (cell.elevation_sw as f32
+                        + cell.elevation_se as f32
+                        + cell.elevation_ne as f32
+                        + cell.elevation_nw as f32)
+                        / 4.0;
+                    let elev_offset = avg_elev * 2.0 * game.camera.zoom;
+
+                    let world_pos = iso.tile_to_screen(TilePos {
+                        x: tx as i32,
+                        y: ty as i32,
+                    });
+                    let screen_pos = game.camera.world_to_screen(world_pos);
+                    let draw_x = screen_pos.x as i32;
+                    // Elevation shifts tiles UP (higher elevation = drawn higher on screen).
+                    let draw_y = screen_pos.y as i32 - elev_offset as i32;
+
+                    let dst = Rect::new(draw_x, draw_y, dst_w, dst_h);
+
+                    // Draw Word 2 overlays — these are OBJECTS (buildings, fences,
+                    // trees) from the OBJ sprite sheet, not terrain from TIL.
+                    // Low indices (1-50) are terrain decorations from TIL.
+                    // Higher indices (100+) are building sprites from OBJ.
+                    // Skip marker sprites >= 500 (skulls/debug).
+                    if let Some(or) = obj_renderer {
+                        let obj_pw = or.tile_pixel_width() as f32;
+                        let obj_ph = or.tile_pixel_height() as f32;
+                        let y_off = (obj_ph - iso.tile_height) * game.camera.zoom;
+                        let obj_dst_w = (obj_pw * game.camera.zoom) as u32;
+                        let obj_dst_h = (obj_ph * game.camera.zoom) as u32;
+
+                        for overlay_idx in [cell.overlay_0, cell.overlay_1, cell.overlay_2] {
+                            if overlay_idx == 0 || overlay_idx >= 500 {
+                                continue;
+                            }
+                            if overlay_idx < 50 {
+                                // Low indices: terrain decoration from TIL at tile size.
+                                if let Some(overlay_tex) = tr.get_texture(overlay_idx as usize) {
+                                    canvas.copy(overlay_tex, None, dst).ok();
+                                    overlays_drawn += 1;
+                                }
+                            } else {
+                                // High indices: building/object from OBJ sprite sheet.
+                                // OBJ sprites are 128x128, offset up to sit on terrain.
+                                if let Some(obj_tex) = or.get_texture(overlay_idx as usize) {
+                                    let obj_dst = Rect::new(
+                                        draw_x,
+                                        draw_y - y_off as i32,
+                                        obj_dst_w,
+                                        obj_dst_h,
+                                    );
+                                    canvas.copy(obj_tex, None, obj_dst).ok();
+                                    overlays_drawn += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            trace!(overlays_drawn, "Word 2 overlay pass complete");
         }
     } else {
         render_placeholder_grid(canvas, &game.camera, &game.iso_config);

@@ -184,6 +184,11 @@ impl<'tc> TileMapRenderer<'tc> {
     /// visible bounds. Uses the staggered grid projection — `tile_to_screen`
     /// already handles the odd-row half-tile offset, so we draw each tile
     /// at its top-left screen position with no additional centering.
+    /// Render the terrain tile layer with elevation offsets from Word 4.
+    ///
+    /// Each cell's 4-corner elevation values are averaged to compute a
+    /// vertical offset. Higher elevation = drawn higher on screen, creating
+    /// the illusion of hills and valleys on the isometric map.
     pub fn render_map(
         &self,
         canvas: &mut Canvas<Window>,
@@ -233,12 +238,18 @@ impl<'tc> TileMapRenderer<'tc> {
                 let screen_pos = camera.world_to_screen(world_pos);
 
                 let draw_x = screen_pos.x;
-                let draw_y = screen_pos.y;
 
-                // Use the grid's tile dimensions (128x64) for the destination rect,
-                // NOT the sprite's pixel dimensions (128x63). The sprites are 1px
-                // shorter than the grid spacing — the exe uses 64px row spacing
-                // (confirmed by sar 6 = /64) and stretches the 63px sprite to fill.
+                // Apply elevation from Cell Word 4 — average the 4 corner heights
+                // and shift the tile upward on screen. This creates visual terrain
+                // elevation (hills, valleys) without actual 3D geometry.
+                let cell = map.get_cell(tx, ty);
+                let elev_offset = cell.map(|c| {
+                    let avg = (c.elevation_sw as f32 + c.elevation_se as f32
+                        + c.elevation_ne as f32 + c.elevation_nw as f32) / 4.0;
+                    avg * 2.0 * camera.zoom
+                }).unwrap_or(0.0);
+                let draw_y = screen_pos.y - elev_offset;
+
                 let dst_w = (iso.tile_width * camera.zoom) as u32;
                 let dst_h = (iso.tile_height * camera.zoom) as u32;
 
@@ -247,12 +258,10 @@ impl<'tc> TileMapRenderer<'tc> {
                     warn!(tx, ty, error = %e, "failed to draw tile");
                 }
 
-                // Render tile overlay layers (layer1, layer2) on top of the base.
-                // These come from Word 1 of the cell and use the same TIL sprite sheet.
-                // All 512 valid indices can appear here (unlike objects which use
-                // the OBJ sprite sheet via Word 5).
+                // Render Word 1 terrain overlays (layer1, layer2) from TIL.
+                // Skip marker sprites at indices >= 500 (skulls/debug markers).
                 for overlay_idx in [tile.layer1(), tile.layer2()] {
-                    if overlay_idx > 0 {
+                    if overlay_idx > 0 && overlay_idx < 500 {
                         if let Some(Some(overlay_tex)) =
                             self.tile_textures.get(overlay_idx as usize)
                         {

@@ -1,133 +1,60 @@
 # HANDOFF.md — Open Wages → Claude Code Session
 
 ## TL;DR
-You're picking up a clean-room Rust reimplementation of *Wages of War: The Business of Battle* (1996). **All 6 phases are complete.** The engine reads every game data file, has a full combat system with AI, an SDL2 game loop with state machine, save/load, config, mod support, and audio parsing. **280 tests, all passing.** Next steps: polish, wire remaining integration points, and playtest.
+Clean-room Rust reimplementation of *Wages of War* (1996). **MAP parser rewritten** with correct 140x72 grid from deep Wow.exe RE. AVI cutscenes with audio working. Soldier animation system wired up. Combat SFX and voice playback added. Terrain rendering mostly correct — compound floors visible, buildings partially rendering from OBJ sprites. Dev hotkeys for fast testing.
 
-## What's Done — All Phases Complete
+## Current State (2026-04-11)
 
-### Phase 1: Data Reconnaissance — COMPLETE
-- [x] Game ISO extracted to `data/WOW/` (1254 files classified)
-- [x] 12 format specification documents in `docs/FORMAT_*.md`
-- [x] All binary formats triaged (sprite, MAP, PCX, VLA/VLS, WRI)
-- [x] Rust RE tools: survey, triage, validate-all (replaced Python)
+### Working
+- Full game loop: Office → Hire → Contract → Deploy → Fight → Win → Debrief
+- MAP parser: 140x72 grid, 5 parallel cell arrays, all metadata blocks
+- Staggered isometric projection (128x64 tiles, 32px half-height row spacing, odd-row +64px stagger)
+- AVI cutscene playback with audio (ffmpeg-sidecar, MSRLE + ADPCM)
+- MIDI music playback (M key to mute)
+- Combat SFX (pistol/rifle/shotgun from SND/ WAVs)
+- Voice line system (WAV playback on hire/selection)
+- Video phone debrief (ACCT.OBJ portrait, PHONSPR.OBJ background)
+- Soldier animation system (COR/DAT parsed, AnimController per merc, 2000 frames decoded)
+- Terrain with Word 1 overlays (indices 1-499 from TIL)
+- Word 2 overlays split: low indices from TIL, high from OBJ
+- Window icon (Wow.ico)
+- Dev hotkeys: F1-F5, F12, M
 
-### Phase 2: Data Parsers — COMPLETE (17 parsers)
-- [x] Text parsers: mercs, weapons, equip, strings, mission, ai_nodes, moves, shop, buttons, animation, target, textrect
-- [x] Binary parsers: sprite (RLE-compressed 8bpp), palette (PCX extraction), map_loader (248K tile grids), wri (Windows Write)
-- [x] VLA/VLS audio parser with lip-sync timing and embedded WAV extraction
-- [x] Full game data validator (case-insensitive, 69+ required files)
+### Known Issues
+1. **Building walls/fences missing** — Word 2 high-index OBJ sprites showing some elements but not walls. Need to investigate the TIL/OBJ index mapping more carefully. The tileset reference table (31 x u16 at MAP offset 0x031624) may hold the key.
+2. **Skull markers** (503-507) visible as black diamonds — filtered from rendering but some still appear
+3. **Path alignment** — terrain transitions slightly off at diamond edges
+4. **Animation triggers** — only idle plays, walk/shoot/die not wired to game actions
+5. **VLS lip-sync** — accountant portrait is static, viseme timeline not connected
+6. **Voice files** — per-merc voices are inside VLS/VLA containers, not standalone WAVs
 
-### Phase 3: Core Rules — COMPLETE
-- [x] Runtime mercs (ActiveMerc, MercStatus, from_data() bridge)
-- [x] Initiative-based combat (BinaryHeap, all factions interleaved — NOT IGOUGO)
-- [x] Damage resolution using TARGET.DAT hit table + penetration checks
-- [x] Suppression system (will vs. firepower)
-- [x] Weather effects (6 types, accuracy/sight/smoke modifiers)
-- [x] A* pathfinding (8-directional, AP budgets, terrain costs)
-- [x] Bresenham line-of-sight + fog of war visibility casting
-- [x] Game state machine (Office → Travel → Mission → Debrief)
+### RE Docs Completed This Session
+- `docs/BINARY_FORMATS_DEEP_RE.md` — Complete Wow.exe disassembly (MAP, cells, projection, sprites, WinG)
+- `docs/COR_ANIM_FORMAT.md` — Animation index + DAT sprite archive, verified across 32 pairs
+- `docs/VLS_VLA_FORMAT.md` — Voice lip-sync with viseme timelines
+- `docs/WRI_FORMAT.md` — Microsoft Write mission brief extraction
 
-### Phase 4: Economy + Combat Loop — COMPLETE
-- [x] Financial ledger with transaction history
-- [x] Merc hiring pool (max 8, 3-tier fees, fire/rehire)
-- [x] Slot-based inventory with encumbrance system
-- [x] Contract negotiation (4-round counter-offers with declining success)
-- [x] Mission setup (enemy generation from MSSN data, weather rolling)
-- [x] Action system: Move, Shoot, Reload, Crouch, OverWatch, EndTurn
-- [x] Enemy AI decision tree with alert escalation (shoot → advance → hunt → cover)
+### Key Discoveries
+- MAP grid is 140x72 = 10,080 cells (NOT 200x252)
+- 5 parallel cell arrays, 4 bytes each, sequential on disk
+- Word 5 object_id: 0xFF = empty sentinel (10079/10080 cells are 0xFF)
+- Elevation (Word 4): all zeros across ALL 16 missions — never used by map editor
+- Staggered grid needs 32px row spacing for diamond interlocking (exe uses 64px internally)
+- Tile sprites are diamonds with transparent corners (palette index 0)
+- TIL and OBJ both have 512 frames — Word 2 overlays may reference OBJ for buildings
 
-### Phase 5: Rendering — COMPLETE
-- [x] Isometric camera with scroll/zoom and frustum culling
-- [x] Tile map renderer (painter's algorithm, back-to-front)
-- [x] Sprite renderer with SDL2 texture caching
-- [x] Animation controller (.COR-driven, 8 directions, weapon classes, mirroring)
-- [x] Unit renderer (health bars, selection/suppression overlays, movement/attack highlights)
-- [x] HUD (AP/HP bars, action buttons, message log)
-- [x] UI system (hit-testing, hover/press states, BTN-to-runtime conversion)
-- [x] Developer tools: sprite-viewer, map-viewer
+### Architecture
+- `ow-data/src/map_loader.rs` — Rewritten MAP parser with MapCell struct (all 5 words)
+- `ow-render/src/iso_math.rs` — Staggered grid projection (tile_to_screen, screen_to_tile)
+- `ow-app/src/avi_player.rs` — NEW: AVI cutscene playback via ffmpeg-sidecar
+- `ow-audio/src/sfx.rs` — NEW: Combat SFX manager
+- `ow-audio/src/voice.rs` — NEW: Voice line playback
+- `ow-app/src/game_loop.rs` — ~4000+ lines, needs splitting
 
-### Phase 6: Integration — COMPLETE
-- [x] SDL2 game loop state machine (office → travel → deploy → combat → extract → debrief)
-- [x] Save/load (JSON, atomic writes, version migration, save listing)
-- [x] Config system (window, audio, controls, key bindings, mod dirs)
-- [x] OXCE-style ruleset with mod overlay (last-writer-wins merging)
-- [x] Audio catalogs (WAV/MIDI) + VLA/VLS "VALS" format with lip-sync
-- [x] WRI parser (all 49 briefing/contract files, missions 4-16 unlocked)
-- [x] validate-all tool (101/104 mission files pass)
-
-## Remaining Work (Polish + Integration)
-
-### Wire remaining integration points
-- [ ] Connect game_loop.rs to main.rs (needs sdl2 dep in ow-app Cargo.toml)
-- [ ] Load real tilesets in map renderer (currently placeholder grid)
-- [ ] Wire unit sprites from ANIM .DAT + .COR into combat rendering
-- [ ] Connect AI decide_action/execute_action to combat turn loop
-- [ ] Hook audio catalogs to SDL2_mixer for actual playback
-
-### Known parser edge cases
-- [ ] ABDULS10.DAT has "OUTOFSTOCKED" typo — shop parser needs tolerance
-- [ ] MOVES15/16.DAT have tab-delimited edge cases
-- [ ] 3/104 files fail in validate-all (upstream parser fixes needed)
-
-### Polish
-- [ ] Font rendering (currently placeholder colored bars instead of text)
-- [ ] Full merc portrait display in hiring screen
-- [ ] Mission briefing text display using WRI parser output
-- [ ] Sound effect playback during combat (hit, miss, explosion)
-- [ ] MIDI music playback in menus and combat
-- [ ] Save/load UI in pause menu
-
-### Long-term
-- [ ] All 16 missions playable end-to-end
-- [ ] Multiplayer (hot-seat)
-- [ ] Steam Deck / Linux packaging
-
-## Crate Architecture (6 crates, ~28,600 lines)
-
-| Crate | Modules | Tests | Purpose |
-|-------|---------|-------|---------|
-| `ow-data` | 17 parsers | 128 | Read every original game file format |
-| `ow-core` | 14 modules | 139 | Game rules, combat, economy, AI — zero render deps |
-| `ow-render` | 9 modules | 10 | SDL2 isometric renderer, HUD, UI, animation |
-| `ow-audio` | 3 modules | 12 | WAV/MIDI catalogs, VLA/VLS parser |
-| `ow-app` | 2 modules | 0 | Main binary + SDL2 game loop |
-| `ow-tools` | 4 binaries | 0 | survey, triage, validate-all, (sprite-viewer) |
-
-## Key Technical Facts
-- **17 data parsers** reading every file format in the game
-- **57 mercenaries**, **58 weapons** (14 categories), **25 equipment items**
-- **16 missions** with 14-section definition files
-- **120+ sprite files** decoded via shared RLE container format
-- **52 MAP files** (200x252 tile grids, fixed 248K)
-- **49 WRI files** parsed for briefing/contract text
-- **Hit probability table** (141x20 lookup, core of combat math)
-- **Combat is initiative-based**, NOT I-go-you-go
-- **OXCE-style mod support** with ruleset overlay merging
-- **Save files are human-readable JSON** with atomic writes
-
-## Environment
-- **Machine:** kokonoe (i9-11900K, RTX 3070 Ti, 64GB, Win11)
-- **Toolchain:** Rust stable (all code is Rust, no Python)
-- **SDL2:** Installed via MSYS2 pacman (mingw-w64-x86_64-SDL2 + mixer/image/ttf)
-- **Reference project:** OpenXCOM Extended (OXCE)
-
-## File Layout
-```
-open-wages/
-├── CLAUDE.md              # Project soul document
-├── README.md              # Public-facing readme
-├── HANDOFF.md             # This file
-├── Cargo.toml             # Workspace root
-├── crates/
-│   ├── ow-data/           # 17 parsers (text + binary formats)
-│   ├── ow-core/           # 14 modules (combat, economy, AI, save, config, mods)
-│   ├── ow-render/         # 9 modules (SDL2 renderer, HUD, UI, animation)
-│   ├── ow-audio/          # 3 modules (WAV, MIDI, VLA/VLS)
-│   ├── ow-app/            # Main binary + game loop
-│   └── ow-tools/          # Dev tools (survey, triage, validate-all)
-├── docs/                  # 12 format specs + architecture notes
-└── skills/                # RE reference .skill files
-```
-
-## GitHub
-Repo at `suhteevah/open-wages`. Public, dual MIT/Apache-2.0, no monetization ever.
+## Next Steps (Priority Order)
+1. Fix building/fence rendering — investigate OBJ sprite content and tileset reference table
+2. Wire animation triggers (walk/shoot/die) to game actions
+3. Filter skull marker sprites (503-507) completely
+4. Extract per-merc voices from VLS containers
+5. Wire VLS viseme timeline to accountant portrait
+6. Split game_loop.rs into sub-modules

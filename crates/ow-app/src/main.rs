@@ -95,11 +95,31 @@ fn main() -> anyhow::Result<()> {
         .video()
         .map_err(|e| anyhow::anyhow!("SDL2 video init failed: {e}"))?;
 
-    let window = video
+    let mut window = video
         .window("Open Wages — Wages of War Engine", 1280, 720)
         .position_centered()
         .resizable()
         .build()?;
+
+    // Set the window icon from the original game's Wow.ico if available.
+    let icon_path = args.data_dir.join("extracted").join("Group12").join("Wow.ico");
+    if icon_path.exists() {
+        // SDL2 can load BMP/ICO surface — try loading the .ico directly.
+        match sdl2::surface::Surface::load_bmp(&icon_path) {
+            Ok(icon_surface) => {
+                window.set_icon(&icon_surface);
+                info!("Window icon set from Wow.ico");
+            }
+            Err(e) => {
+                // ICO might not load as BMP — try using the SDL2 image loader if available.
+                info!("Could not load icon as BMP ({e}), trying SDL2_image");
+                if let Ok(icon_surface) = <sdl2::surface::Surface as sdl2::image::LoadSurface>::from_file(&icon_path) {
+                    window.set_icon(&icon_surface);
+                    info!("Window icon set from Wow.ico via SDL2_image");
+                }
+            }
+        }
+    }
 
     let mut canvas = window.into_canvas().accelerated().present_vsync().build()?;
 
