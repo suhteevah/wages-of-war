@@ -25,14 +25,27 @@ pub type Palette256 = [(u8, u8, u8); 256];
 /// consecutive [R, G, B, A] quads — matching `PixelFormatEnum::RGBA32`
 /// (which is endian-aware RGBA on all platforms).
 pub fn apply_palette(pixels: &[u8], palette: &Palette256) -> Vec<u8> {
+    apply_palette_with_brightness(pixels, palette, 1.0)
+}
+
+/// Convert indexed pixels to RGBA with an optional brightness multiplier.
+///
+/// `brightness` of 1.0 = original colors, 1.5 = 50% brighter, etc.
+/// The original game was designed for CRT displays which had different
+/// gamma characteristics than modern LCD panels, so a brightness boost
+/// of ~1.4-1.6 gives a closer visual match.
+pub fn apply_palette_with_brightness(pixels: &[u8], palette: &Palette256, brightness: f32) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(pixels.len() * 4);
 
     for &idx in pixels {
         if idx == 0 {
-            // Transparent pixel — zero all channels including alpha.
             rgba.extend_from_slice(&[0, 0, 0, 0]);
         } else {
             let (r, g, b) = palette[idx as usize];
+            // Apply brightness boost to compensate for CRT vs LCD gamma difference.
+            let r = ((r as f32 * brightness).min(255.0)) as u8;
+            let g = ((g as f32 * brightness).min(255.0)) as u8;
+            let b = ((b as f32 * brightness).min(255.0)) as u8;
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }

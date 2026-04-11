@@ -39,7 +39,7 @@ use tracing::{debug, trace, warn};
 
 use crate::camera::Camera;
 use crate::iso_math::{IsoConfig, TilePos};
-use crate::palette::{apply_palette, Palette256};
+use crate::palette::{apply_palette_with_brightness, Palette256};
 use ow_data::map_loader::GameMap;
 use ow_data::sprite::SpriteSheet;
 
@@ -140,7 +140,10 @@ impl<'tc> TileMapRenderer<'tc> {
             };
 
             // Step 2: Apply palette to convert indexed pixels to RGBA.
-            let rgba = apply_palette(&pixels, palette);
+            // Boost brightness by 1.5x to compensate for CRT-to-LCD gamma difference.
+            // The original game was designed for CRT displays with higher inherent gamma,
+            // making the dark jungle tiles look much brighter than on modern LCDs.
+            let rgba = apply_palette_with_brightness(&pixels, palette, 1.5);
 
             // Step 3: Create SDL2 texture and upload RGBA pixel data.
             let mut texture = self
@@ -255,6 +258,19 @@ impl<'tc> TileMapRenderer<'tc> {
                 let dst = Rect::new(draw_x as i32, draw_y as i32, dst_w, dst_h);
                 if let Err(e) = canvas.copy(texture, None, dst) {
                     warn!(tx, ty, error = %e, "failed to draw tile");
+                }
+
+                // Render overlay layers (layer1 and layer2) on top of the base tile.
+                // These contain buildings, paths, vegetation, and detail sprites
+                // that are composited over the base terrain.
+                for overlay_layer in [tile.layer1, tile.layer2] {
+                    if overlay_layer > 0 {
+                        if let Some(Some(overlay_tex)) = self.tile_textures.get(overlay_layer as usize) {
+                            if let Err(e) = canvas.copy(overlay_tex, None, dst) {
+                                trace!(tx, ty, layer = overlay_layer, error = %e, "overlay draw failed");
+                            }
+                        }
+                    }
                 }
 
                 tiles_drawn += 1;
