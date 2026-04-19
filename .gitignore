@@ -57,3 +57,9 @@ lpt8
 lpt9
 screenshot_*.jpg
 screenshot_*.bmp
+
+# Added by uploader (secret-leak hardening, 2026-04-18)
+.secrets
+VOXCLAW.md
+scratch/
+*.local
