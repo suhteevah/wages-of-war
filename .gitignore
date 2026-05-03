@@ -23,6 +23,15 @@ Desktop.ini
 # Survey/triage output
 file_survey.json
 
+# Dev auto-screenshot output (env-gated by OW_AUTO_SCREENSHOT_MS)
+dev-screenshots/
+
+# Logs from instrumented runs
+*.log
+
+# RE artifacts (generated from Wow.exe via Ghidra; outside crates per clean-room)
+re/ghidra/projects/
+
 # IDE
 .vscode/
 .idea/

@@ -661,6 +661,16 @@ pub fn run_game_loop_with_pump(
     let mut soldier_anim_set: Option<ow_data::animation::AnimationSet> = None;
     // Per-merc animation controllers, keyed by merc index in the team.
     let mut soldier_anims: Vec<ow_render::anim_controller::AnimController> = Vec::new();
+
+    // Per-merc snapshot of state from the previous frame, in lockstep with
+    // `game.game_state.team`. Drives the animation state-watcher below: when
+    // a merc's position / hp / ap differs from its snapshot, we transition
+    // its AnimController accordingly. Tuple is (id, position, hp, ap).
+    let mut prev_merc_states: Vec<(MercId, Option<ow_core::merc::TilePos>, u32, u32)> =
+        Vec::new();
+    // Frames remaining before Walk auto-reverts to Idle. Tracks per-merc by
+    // index. Set on each Walk transition; counted down each frame.
+    let mut walk_grace_remaining: Vec<u32> = Vec::new();
     // Backwards compat — kept as fallback if full animation loading fails.
     let mut soldier_texture: Option<Texture> = None;
 
@@ -671,6 +681,38 @@ pub fn run_game_loop_with_pump(
     let mut last_frame = Instant::now();
     let mut running = true;
     let mut _screenshot_count = 0u32;
+
+    // -----------------------------------------------------------------------
+    // Dev auto-screenshot — env-gated. When `OW_AUTO_SCREENSHOT_MS` is set
+    // to a positive integer, the loop drops a BMP into
+    // `dev-screenshots/run-<unix-ts>/` every N ms, with a phase tag in the
+    // filename so a thousand frames are still searchable. This exists so an
+    // analysis session can see what actually rendered during a play session
+    // without anyone hand-pressing F12 every few seconds. Disabled by default;
+    // pure dev tooling, gitignored output dir.
+    // -----------------------------------------------------------------------
+    let auto_ss_interval_ms: Option<u128> = std::env::var("OW_AUTO_SCREENSHOT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &u128| n > 0);
+    let auto_ss_dir: Option<std::path::PathBuf> = if let Some(ms) = auto_ss_interval_ms {
+        let run_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dir = std::path::PathBuf::from(format!("dev-screenshots/run-{run_id}"));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(?dir, "auto-screenshot mkdir failed: {e} — feature disabled");
+            None
+        } else {
+            info!(interval_ms = ms, dir = %dir.display(), "Auto-screenshot enabled");
+            Some(dir)
+        }
+    } else {
+        None
+    };
+    let mut last_auto_ss = Instant::now();
+    let mut auto_ss_count = 0u32;
 
     // -----------------------------------------------------------------------
     // Main loop: poll events -> update -> render -> present -> sleep
@@ -808,6 +850,136 @@ pub fn run_game_loop_with_pump(
 
         // -- Update --
         update_phase(&mut game, delta_ms, &mut sfx_manager);
+
+        // Drive soldier animations from merc state changes. The
+        // AnimController already plays the chosen action; this block
+        // decides WHEN to switch by diffing each merc's position / hp / ap
+        // against the previous frame's snapshot. Walk fires on position
+        // delta with an 8-way direction computed from the move vector.
+        // ShootStand fires when AP drops without movement (i.e. the click
+        // resolved as an attack). Die fires once on the alive→0-hp edge.
+        // Without this watcher the controllers stay stuck on Idle, which
+        // is the bug the handoff documented as "only idle plays."
+        {
+            use ow_render::anim_controller::{AnimAction, Direction};
+
+            // Map a tile-delta to one of 8 cardinal/diagonal directions.
+            // +y is south on the staggered isometric grid (row index grows
+            // downward), so the dy sign maps directly to N/S.
+            fn dir_from_delta(dx: i32, dy: i32) -> Direction {
+                match (dx.signum(), dy.signum()) {
+                    (0, -1) => Direction::N,
+                    (1, -1) => Direction::NE,
+                    (1, 0) => Direction::E,
+                    (1, 1) => Direction::SE,
+                    (0, 1) => Direction::S,
+                    (-1, 1) => Direction::SW,
+                    (-1, 0) => Direction::W,
+                    (-1, -1) => Direction::NW,
+                    _ => Direction::S,
+                }
+            }
+
+            for (i, merc) in game.game_state.team.iter().enumerate() {
+                let Some(ctrl) = soldier_anims.get_mut(i) else { continue };
+                let prev = prev_merc_states.get(i).copied();
+                let prev_pos = prev.and_then(|p| p.1);
+                let prev_hp = prev.map(|p| p.2).unwrap_or(merc.current_hp);
+                let prev_ap = prev.map(|p| p.3).unwrap_or(merc.current_ap);
+
+                // Death edge: alive last frame, dead this frame. Set Die
+                // and skip — the controller will hold the final death frame.
+                if prev_hp > 0 && merc.current_hp == 0 {
+                    ctrl.set_action(AnimAction::Die, Direction::S, 1);
+                    continue;
+                }
+                if merc.current_hp == 0 {
+                    continue;
+                }
+
+                // Movement: position changed since last frame.
+                if let (Some(np), Some(pp)) = (merc.position, prev_pos) {
+                    if np.x != pp.x || np.y != pp.y {
+                        let dir = dir_from_delta(np.x - pp.x, np.y - pp.y);
+                        ctrl.set_action(AnimAction::Walk, dir, 1);
+                        continue;
+                    }
+                }
+
+                // Shoot: AP dropped without a position change, i.e. the
+                // player's click resolved as an attack. Direction here is
+                // a default (S) — refining this requires plumbing the
+                // target tile through to the watcher; out of scope for now.
+                // The animation still plays and looks correct because the
+                // sprite mostly faces the camera at S.
+                if merc.current_ap < prev_ap {
+                    ctrl.set_action(AnimAction::ShootStand, Direction::S, 1);
+                    continue;
+                }
+            }
+
+            // Auto-revert finishing one-shot animations (ShootStand/Hit/
+            // Throw/Melee) back to Idle, and revert Walk after a brief
+            // grace period since the in-game movement is teleport-based —
+            // Walk only ever fires for one frame so the loop would
+            // otherwise march in place forever.
+            const WALK_GRACE_FRAMES: u32 = 24; // ~400ms at 60fps
+            for (i, merc) in game.game_state.team.iter().enumerate() {
+                let Some(ctrl) = soldier_anims.get_mut(i) else { continue };
+                if merc.current_hp == 0 {
+                    continue;
+                }
+                let cur_action = ctrl.state().map(|s| s.action);
+                match cur_action {
+                    Some(AnimAction::ShootStand)
+                    | Some(AnimAction::ShootCrouch)
+                    | Some(AnimAction::Hit)
+                    | Some(AnimAction::Throw)
+                    | Some(AnimAction::Melee)
+                        if ctrl.is_finished() =>
+                    {
+                        ctrl.set_action(AnimAction::Idle, Direction::S, 1);
+                        if let Some(slot) = walk_grace_remaining.get_mut(i) {
+                            *slot = 0;
+                        }
+                    }
+                    Some(AnimAction::Walk) => {
+                        let slot = match walk_grace_remaining.get_mut(i) {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        *slot = slot.saturating_sub(1);
+                        if *slot == 0 {
+                            ctrl.set_action(AnimAction::Idle, Direction::S, 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Resize the walk-grace tracker to match team length, and reset
+            // the counter for any merc whose Walk animation just (re)fired.
+            walk_grace_remaining.resize(game.game_state.team.len(), 0);
+            for (i, merc) in game.game_state.team.iter().enumerate() {
+                let Some(prev) = prev_merc_states.get(i).copied() else { continue };
+                if let (Some(np), Some(pp)) = (merc.position, prev.1) {
+                    if np.x != pp.x || np.y != pp.y {
+                        if let Some(slot) = walk_grace_remaining.get_mut(i) {
+                            *slot = WALK_GRACE_FRAMES;
+                        }
+                    }
+                }
+            }
+
+            // Snapshot for next frame's diff. Resized to match team length.
+            prev_merc_states.clear();
+            prev_merc_states.extend(
+                game.game_state
+                    .team
+                    .iter()
+                    .map(|m| (m.id, m.position, m.current_hp, m.current_ap)),
+            );
+        }
 
         // Tick soldier animation controllers so idle/walk/shoot frames advance.
         for ctrl in soldier_anims.iter_mut() {
@@ -1190,6 +1362,21 @@ pub fn run_game_loop_with_pump(
 
         canvas.present();
 
+        // Dev auto-screenshot tick. Cheap when disabled (just two `if let`s).
+        if let (Some(ms), Some(dir)) = (auto_ss_interval_ms, auto_ss_dir.as_ref()) {
+            if now.duration_since(last_auto_ss).as_millis() >= ms {
+                let phase = phase_label(&game.phase_handler)
+                    .replace(' ', "_")
+                    .replace('—', "-")
+                    .replace('/', "_")
+                    .to_lowercase();
+                let path = dir.join(format!("ss_{:05}_{phase}.bmp", auto_ss_count));
+                save_screenshot_to_path(&canvas, &path);
+                auto_ss_count = auto_ss_count.saturating_add(1);
+                last_auto_ss = now;
+            }
+        }
+
         // -- Frame pacing --
         // Sleep for remaining frame budget to hit ~60 fps.
         let frame_elapsed = now.elapsed().as_millis() as u32;
@@ -1306,7 +1493,7 @@ fn handle_phase_input(game: &mut GameLoop, event: &Event, ruleset: &Ruleset, sfx
         Route::Office => handle_office_input(game, event, ruleset, voice),
         Route::Travel => { /* No player input during travel */ }
         Route::Deployment => handle_deployment_input(game, event),
-        Route::Combat => handle_combat_input(game, event, sfx, voice),
+        Route::Combat => handle_combat_input(game, event, ruleset, sfx, voice),
         Route::Extraction => handle_extraction_input(game, event),
         Route::Debrief => handle_debrief_input(game, event),
     }
@@ -1904,7 +2091,13 @@ fn handle_deployment_input(game: &mut GameLoop, event: &Event) {
 /// - Mouse wheel: zoom in/out
 ///
 /// When AI is acting, player input is blocked.
-fn handle_combat_input(game: &mut GameLoop, event: &Event, sfx: &mut SfxManager, voice: &mut Option<VoicePlayer>) {
+fn handle_combat_input(
+    game: &mut GameLoop,
+    event: &Event,
+    ruleset: &Ruleset,
+    sfx: &mut SfxManager,
+    voice: &mut Option<VoicePlayer>,
+) {
     // Check if the AI is acting — block player input if so.
     let ai_acting = match &game.phase_handler {
         PhaseHandler::Combat(c) => c.ai_acting,
@@ -2006,18 +2199,61 @@ fn handle_combat_input(game: &mut GameLoop, event: &Event, sfx: &mut SfxManager,
                 });
 
                 if let Some(eidx) = enemy_idx {
-                    // SHOOT — deal damage to the enemy!
+                    // SHOOT — deal damage to the enemy.
+                    //
+                    // The previous version rolled `rng.gen_range(5..20)` for
+                    // damage regardless of what the merc was carrying. Now we
+                    // look up the equipped weapon from the merc's inventory
+                    // (first matching entry in `ruleset.weapons` by name) and
+                    // use its `damage_class`, `weapon_range`, and `ap_cost`.
+                    // Falls back to the old constants when the merc is
+                    // unarmed so nobody breaks if equipment hookup misfires.
                     let attacker = game.game_state.team.iter().find(|m| m.id == unit_id);
                     let attacker_name = attacker
                         .map(|m| m.name.clone())
                         .unwrap_or_else(|| format!("Unit_{unit_id}"));
                     let wsk = attacker.map(|m| m.wsk).unwrap_or(50);
+                    let attacker_pos = attacker.and_then(|m| m.position);
 
-                    // Simple hit chance based on weapon skill.
+                    // Resolve weapon stats from inventory. We accept any
+                    // inventory item that matches a weapon name; in practice
+                    // the equipment screen pushes weapons in order so the
+                    // first match is the primary.
+                    let weapon = attacker
+                        .and_then(|m| {
+                            m.inventory
+                                .iter()
+                                .find_map(|it| ruleset.weapons.values().find(|w| w.name == it.name))
+                        });
+                    let (weapon_dmg_class, weapon_range, weapon_ap) = match weapon {
+                        Some(w) => (w.damage_class.max(1), w.weapon_range.max(1), w.ap_cost.max(1)),
+                        None => (8, 15, 8), // unarmed-ish fallback
+                    };
+                    let weapon_name = weapon.map(|w| w.name.as_str()).unwrap_or("(fists)");
+
+                    // Range check: Manhattan distance > weapon range = miss.
+                    let target_pos = game.enemies[eidx].position;
+                    let range_tiles = match (attacker_pos, target_pos) {
+                        (Some(a), Some(t)) => {
+                            ((a.x - t.x).abs() + (a.y - t.y).abs()) as u32
+                        }
+                        _ => 0,
+                    };
+                    let out_of_range = range_tiles > weapon_range;
+
+                    // Simple hit chance based on weapon skill, halved if the
+                    // shot is at the edge of range. Capped at 95 so there's
+                    // always a chance to miss. Forced miss when out of range.
                     use rand::Rng;
                     let mut rng = rand::thread_rng();
                     let hit_roll: u32 = rng.gen_range(0..100);
-                    let hit_chance = (wsk as u32).min(95);
+                    let mut hit_chance = (wsk as u32).min(95);
+                    if range_tiles > weapon_range / 2 {
+                        hit_chance = hit_chance / 2;
+                    }
+                    if out_of_range {
+                        hit_chance = 0;
+                    }
 
                     // Collect combat log message after resolving the shot so we
                     // can call log_combat outside the mutable enemy borrow.
@@ -2025,12 +2261,21 @@ fn handle_combat_input(game: &mut GameLoop, event: &Event, sfx: &mut SfxManager,
 
                     let enemy = &mut game.enemies[eidx];
                     if hit_roll < hit_chance {
-                        // Hit! Deal damage based on weapon skill.
-                        let damage = rng.gen_range(5..20);
+                        // Hit! Damage from the weapon's `damage_class`, with
+                        // a small +/- 25% jitter to keep it from being purely
+                        // deterministic. ow-core's full resolve_attack also
+                        // applies penetration vs armor — out of scope here
+                        // until we plumb hit_table + armor through.
+                        let base = weapon_dmg_class;
+                        let lo = (base * 3 / 4).max(1);
+                        let hi = (base * 5 / 4).max(lo + 1);
+                        let damage = rng.gen_range(lo..=hi);
                         let old_hp = enemy.current_hp;
                         enemy.current_hp = enemy.current_hp.saturating_sub(damage);
                         info!(
                             shooter = unit_id,
+                            weapon = weapon_name,
+                            range_tiles,
                             target = %enemy.name,
                             damage,
                             old_hp,
@@ -2038,11 +2283,11 @@ fn handle_combat_input(game: &mut GameLoop, event: &Event, sfx: &mut SfxManager,
                             "HIT! Damage dealt"
                         );
 
-                        // Deduct AP for shooting
+                        // Deduct AP for shooting (weapon's real cost now).
                         if let Some(merc) =
                             game.game_state.team.iter_mut().find(|m| m.id == unit_id)
                         {
-                            merc.current_ap = merc.current_ap.saturating_sub(8);
+                            merc.current_ap = merc.current_ap.saturating_sub(weapon_ap);
                         }
 
                         if enemy.current_hp == 0 {
@@ -2061,20 +2306,32 @@ fn handle_combat_input(game: &mut GameLoop, event: &Event, sfx: &mut SfxManager,
                     } else {
                         info!(
                             shooter = unit_id,
+                            weapon = weapon_name,
+                            range_tiles,
+                            out_of_range,
                             target = %enemy.name,
                             roll = hit_roll,
                             needed = hit_chance,
                             "MISS!"
                         );
-                        log_msg = (
-                            format!("{attacker_name} misses {}!", enemy.name),
-                            CombatLogKind::Miss,
-                        );
-                        // Still costs AP to shoot
-                        if let Some(merc) =
-                            game.game_state.team.iter_mut().find(|m| m.id == unit_id)
-                        {
-                            merc.current_ap = merc.current_ap.saturating_sub(8);
+                        let miss_msg = if out_of_range {
+                            format!(
+                                "{attacker_name}: {} out of range ({range_tiles} > {weapon_range})",
+                                enemy.name
+                            )
+                        } else {
+                            format!("{attacker_name} misses {}!", enemy.name)
+                        };
+                        log_msg = (miss_msg, CombatLogKind::Miss);
+                        // Misses still burn AP — but only if the shot was
+                        // physically possible. Out-of-range clicks are
+                        // free so the player isn't punished for clicking.
+                        if !out_of_range {
+                            if let Some(merc) =
+                                game.game_state.team.iter_mut().find(|m| m.id == unit_id)
+                            {
+                                merc.current_ap = merc.current_ap.saturating_sub(weapon_ap);
+                            }
                         }
                     }
 
@@ -2366,6 +2623,12 @@ fn update_combat(game: &mut GameLoop, _delta_ms: u32, sfx: &mut SfxManager) {
                                 sfx.play(CombatSound::Rifle);
 
                                 if roll < hit_chance {
+                                    // AI damage stays uniform 3-15 for now —
+                                    // enemy weapons in mission_setup are
+                                    // stored as `Weapon_{idx}` placeholders
+                                    // that don't resolve against ruleset.
+                                    // Wiring `enemy_weapons[i] -> Weapon` is
+                                    // a separate task (see HANDOFF).
                                     let damage = rng.gen_range(3..15);
                                     if let Some(merc) =
                                         game.game_state.team.iter_mut().find(|m| m.id == target_id)
@@ -3187,9 +3450,44 @@ fn render_mission_map(
             trace!(objs_drawn, "OBJ pass complete (Cell Word 5)");
         }
 
-        // === Cell Word 2 overlay pass (DISABLED — debugging) ===
-        // TODO: Re-enable once base terrain is verified correct.
-        if false {
+        // === Cell Word 2 overlay pass ===
+        // Re-enabled 2026-05-02 to surface buildings / walls / fences that
+        // sat invisible while this block was `if false`. Each cell carries
+        // up to three overlay indices in MAP Word 2; previous sessions
+        // hypothesised the split was `<50` = TIL terrain decoration,
+        // `>=50` = OBJ buildings — that threshold has no exe-disassembly
+        // basis. We emit a one-shot histogram of the overlay-index
+        // distribution across the whole map on the first frame so we can
+        // see the actual cluster shape and tune the threshold against
+        // ground truth instead of guesses.
+        {
+            static OVERLAY_HISTOGRAM_LOGGED: std::sync::Once = std::sync::Once::new();
+            OVERLAY_HISTOGRAM_LOGGED.call_once(|| {
+                let mut hist = std::collections::BTreeMap::<u16, u32>::new();
+                for ty in 0..map.height() {
+                    for tx in 0..map.width() {
+                        if let Some(cell) = map.get_cell(tx, ty) {
+                            for idx in [cell.overlay_0, cell.overlay_1, cell.overlay_2] {
+                                if idx != 0 {
+                                    *hist.entry(idx).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let total: u32 = hist.values().sum();
+                info!(
+                    unique_indices = hist.len(),
+                    total_overlays = total,
+                    map_w = map.width(),
+                    map_h = map.height(),
+                    "Word 2 overlay histogram (one-shot, all cells)"
+                );
+                for (idx, count) in &hist {
+                    info!(idx = *idx, count = *count, "  overlay-idx");
+                }
+            });
+
             let (min_x, min_y, max_x, max_y) = game.camera.visible_tile_bounds(iso);
             let min_x = min_x.max(0) as usize;
             let min_y = min_y.max(0) as usize;
@@ -3270,6 +3568,117 @@ fn render_mission_map(
             }
 
             trace!(overlays_drawn, "Word 2 overlay pass complete");
+        }
+
+        // === Wall pass (Cell Word 3, terrain_mods[0..12]) ===
+        //
+        // Each MAP cell carries 12 two-bit wall slots in Word 3, parsed into
+        // `MapCell.terrain_mods`. Confirmed against Wow.exe disasm
+        // (`FUN_0041d0f5` switch on direction 1-12, `FUN_0041b26d` extracts
+        // the bits at `>>(8 + j*2) & 3`). Each cell has 4 sub-grids (NW/NE/
+        // SE/SW quadrants) and the 12 walls cover both perimeter and
+        // interior boundaries. The exact direction-to-edge mapping isn't
+        // fully nailed down — `FUN_0041c81c(grid, dir)` in the disasm is
+        // the source of truth and we can refine the geometry once we have
+        // it transcribed. For now we render each non-zero wall as a colored
+        // line segment along an approximate edge so the data becomes
+        // visually inspectable. Color codes:
+        //   value 1 → green (low cover / fence)
+        //   value 2 → yellow (mid wall)
+        //   value 3 → red (full wall / impassable)
+        // Map ground truth: `re/ghidra/projects/analysis/decomp/wallhunt_FUN_0041d0f5.c`
+        // and `wallstruct_FUN_0041b26d.c`.
+        {
+            let mut walls_drawn: u32 = 0;
+            let (min_x, min_y, max_x, max_y) = game.camera.visible_tile_bounds(iso);
+            let min_x = min_x.max(0) as usize;
+            let min_y = min_y.max(0) as usize;
+            let max_x = (max_x as usize).min(map.width().saturating_sub(1));
+            let max_y = (max_y as usize).min(map.height().saturating_sub(1));
+
+            // Tile diamond geometry. The renderer projects each cell to a
+            // 128×64 staggered diamond. We compute the four cardinal corner
+            // points (top/right/bottom/left) for each cell and derive edge
+            // midpoints so we can place the 12 wall segments around them.
+            let half_w = (iso.tile_width as f32 * 0.5) * game.camera.zoom;
+            let half_h = (iso.tile_height as f32 * 0.5) * game.camera.zoom;
+
+            for ty in min_y..=max_y {
+                for tx in min_x..=max_x {
+                    let cell = match map.get_cell(tx, ty) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // Quick-skip: if every wall slot is zero, no work to do.
+                    let any = cell.terrain_mods.iter().any(|w| *w != 0);
+                    if !any {
+                        continue;
+                    }
+
+                    let world = iso.tile_to_screen(TilePos {
+                        x: tx as i32,
+                        y: ty as i32,
+                    });
+                    let s = game.camera.world_to_screen(world);
+
+                    // Diamond corners in screen space. tile_to_screen returns
+                    // the diamond's *top-left bounding-box* origin, so the
+                    // four cardinal points are at predictable offsets.
+                    let north = (s.x + half_w, s.y);
+                    let east = (s.x + half_w * 2.0, s.y + half_h);
+                    let south = (s.x + half_w, s.y + half_h * 2.0);
+                    let west = (s.x, s.y + half_h);
+                    let center = (s.x + half_w, s.y + half_h);
+
+                    // Edge midpoints (between cardinal corners).
+                    let mid = |a: (f32, f32), b: (f32, f32)| -> (f32, f32) {
+                        ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)
+                    };
+                    let ne_mid = mid(north, east);
+                    let se_mid = mid(east, south);
+                    let sw_mid = mid(south, west);
+                    let nw_mid = mid(west, north);
+
+                    // 12 segments around the cell. The exact assignment of
+                    // wall-slot index → segment is a working hypothesis: 8
+                    // perimeter halves clockwise from N, then 4 interior
+                    // spokes. Once we transcribe `FUN_0041c81c` fully we can
+                    // confirm or rotate this.
+                    let segments: [((f32, f32), (f32, f32)); 12] = [
+                        (north, ne_mid),     // 1 — NE-edge upper half
+                        (ne_mid, east),      // 2 — NE-edge lower half
+                        (east, se_mid),      // 3 — SE-edge upper half
+                        (se_mid, south),     // 4 — SE-edge lower half
+                        (south, sw_mid),     // 5 — SW-edge upper half
+                        (sw_mid, west),      // 6 — SW-edge lower half
+                        (west, nw_mid),      // 7 — NW-edge upper half
+                        (nw_mid, north),     // 8 — NW-edge lower half
+                        (north, center),    //  9 — interior spoke N
+                        (east, center),     // 10 — interior spoke E
+                        (south, center),    // 11 — interior spoke S
+                        (west, center),     // 12 — interior spoke W
+                    ];
+
+                    for (slot_idx, wall_value) in cell.terrain_mods.iter().enumerate() {
+                        if *wall_value == 0 {
+                            continue;
+                        }
+                        let color = match *wall_value {
+                            1 => Color::RGB(60, 200, 60),
+                            2 => Color::RGB(220, 200, 40),
+                            _ => Color::RGB(220, 60, 60),
+                        };
+                        let (a, b) = segments[slot_idx];
+                        canvas.set_draw_color(color);
+                        canvas.draw_line(
+                            (a.0 as i32, a.1 as i32),
+                            (b.0 as i32, b.1 as i32),
+                        ).ok();
+                        walls_drawn += 1;
+                    }
+                }
+            }
+            trace!(walls_drawn, "Wall pass complete");
         }
     } else {
         render_placeholder_grid(canvas, &game.camera, &game.iso_config);
@@ -4205,6 +4614,38 @@ mod tests {
 // ---------------------------------------------------------------------------
 // Screenshot — F12 saves the current frame to disk as BMP
 // ---------------------------------------------------------------------------
+
+/// Save the current canvas contents to a specific path. Used by the dev
+/// auto-screenshot loop, which already controls the filename and doesn't
+/// need the collision search the F12 path takes.
+fn save_screenshot_to_path(canvas: &Canvas<Window>, path: &std::path::Path) {
+    let (w, h) = canvas.output_size().unwrap_or((1280, 720));
+    match canvas.read_pixels(None, sdl2::pixels::PixelFormatEnum::RGB24) {
+        Ok(pixels) => {
+            match sdl2::surface::Surface::from_data_pixelmasks(
+                &mut pixels.clone(),
+                w,
+                h,
+                w * 3,
+                &sdl2::pixels::PixelMasks {
+                    bpp: 24,
+                    rmask: 0xFF0000,
+                    gmask: 0x00FF00,
+                    bmask: 0x0000FF,
+                    amask: 0,
+                },
+            ) {
+                Ok(surface) => {
+                    if let Err(e) = surface.save_bmp(path) {
+                        warn!(path = %path.display(), "auto-screenshot save_bmp: {e}");
+                    }
+                }
+                Err(e) => warn!(path = %path.display(), "auto-screenshot surface: {e}"),
+            }
+        }
+        Err(e) => warn!(path = %path.display(), "auto-screenshot read_pixels: {e}"),
+    }
+}
 
 /// Save the current canvas contents to a BMP file.
 /// Files are named screenshot_001.bmp, screenshot_002.bmp, etc.
